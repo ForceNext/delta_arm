@@ -1,0 +1,39 @@
+# ===== 编译产物 =====
+# CMake 构建目录（build.sh 默认在此生成）
+build/
+cmake-build-*/
+
+# CMake 就地构建时生成的缓存/文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+install_manifest.txt
+
+# 编译中间产物与二进制
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+delta_bottom
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 编辑器 / 系统文件 =====
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
