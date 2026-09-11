@@ -41,10 +41,15 @@ target_link_libraries(common PUBLIC
 )
 
 # ---------------------------------------------------------------------------
+# drives: 串口驱动（SerialPort）
+# ---------------------------------------------------------------------------
+add_subdirectory(drives)
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 add_executable(delta_bottom user/main.cpp)
 target_link_libraries(delta_bottom PRIVATE
   common
-  yaml-cpp
+  drives
 )

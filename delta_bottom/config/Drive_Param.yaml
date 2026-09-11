@@ -1,22 +1,6 @@
 serial:
-  port: "/dev/ttyS3"
+  port: "/dev/ttyACM0"
   baudrate: 921600
-
-bus:
-  slave_addrs: [1, 2, 3]
-
-control:
-  period_us: 2000
-  default_speed_rpm: 500
-  default_accel: 50
-  pulses_per_rev: 51200
-
-realtime:
-  rx_tx_cpu: 3
-  ctrl_cpu: 4
-  rx_tx_priority: 95
-  ctrl_priority: 90
-  lock_memory: true
 
 motors:
   - addr: 1
