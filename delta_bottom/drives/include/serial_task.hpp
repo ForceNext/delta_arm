@@ -27,7 +27,6 @@ class SerialTask
         // 接收线程配置（从 configs/thread_config.yaml 的 interface_task.task_thread 读取）
         int   cpu_      = 0;      // 绑定的 CPU 核
         int   priority_ = 0;      // 线程优先级（SCHED_FIFO）
-        float thread_t_ = 0.0f;   // 线程周期（秒），事件驱动模式下未使用
 
         SerialPort& port_;                  // 串口（发送/接收共用，外部传入）
         std::thread recv_thread_;           // 接收线程句柄
