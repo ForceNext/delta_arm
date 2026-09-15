@@ -1,4 +1,5 @@
 #include "serial_port.hpp"
+#include <chrono>
 
 SerialPort::~SerialPort() { close(); }
 
@@ -6,7 +7,7 @@ SerialPort::~SerialPort() { close(); }
 SerialPort::SerialPort(int argc, char** argv)
 {
     //读取yaml
-    std::string path = (argc > 1) ? argv[1] : "config/Drive_Param.yaml";
+    std::string path = (argc > 1) ? argv[1] : "configs/hardware_config.yaml";
     try 
     {
         YAML::Node root = YAML::LoadFile(path);
@@ -181,7 +182,7 @@ ssize_t SerialPort::write(const std::vector<uint8_t>& data)
     return write(data.data(), data.size());
 }
 
-ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms) {
+ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms, uint64_t* first_byte_ns) {
     if (fd_ < 0) return -1;
 
     size_t total = 0;
@@ -211,6 +212,12 @@ ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms) {
             return total > 0 ? (ssize_t)total : -1;
         }
         if (n == 0) break;
+
+        // 收到首个字节时记录时间戳（单调时钟，用于测量响应延迟）
+        if (total == 0 && first_byte_ns) {
+            *first_byte_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
 
         total += n;
         // 收到首个字节后，把超时缩短，用于等待帧内剩余字节

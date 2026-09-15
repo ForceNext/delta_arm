@@ -32,7 +32,8 @@ public:
     void close();
     ssize_t write(const uint8_t* data, size_t len);
     ssize_t write(const std::vector<uint8_t>& data);
-    ssize_t read(uint8_t* buffer, size_t len, int timeout_ms = 500);
+    ssize_t read(uint8_t* buffer, size_t len, int timeout_ms = 500,
+                 uint64_t* first_byte_ns = nullptr);  // 出参：收到首个字节的单调时钟纳秒时间戳
     // 清空接收缓冲（每次发帧前调用，防止残留字节导致帧错位）
     void flushInput();
 };
