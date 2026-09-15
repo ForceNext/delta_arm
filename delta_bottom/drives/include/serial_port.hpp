@@ -23,6 +23,7 @@ private:
    DriveParam param;
    char yaml_err = 0;
    int fd_ = -1;
+   bool serial_opened_ = false;
 public:
     SerialPort(int argc, char** argv);
     ~SerialPort();

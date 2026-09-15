@@ -49,7 +49,14 @@ SerialPort::SerialPort(int argc, char** argv)
         param.baud_rate = 921600;
         std::cerr << "设置默认参数 -- " << param.port_name << ", " << param.baud_rate << std::endl;
     }
-    open(param.port_name, param.baud_rate);//开启串口
+    if(open(param.port_name, param.baud_rate))//开启串口
+    {
+        serial_opened_ = true;
+    }
+    else
+    {
+        serial_opened_ = false; 
+    }
 }
 
 int SerialPort::baudrateToSpeed(int baudrate) 
