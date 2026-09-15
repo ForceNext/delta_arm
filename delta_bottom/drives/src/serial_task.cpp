@@ -89,6 +89,29 @@ void SerialTask::stop()
     if (recv_thread_.joinable()) recv_thread_.join();
 }
 
+void SerialTask::setPendingRequest(uint8_t func, uint16_t start_addr, uint16_t reg_count)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    pending_.active     = true;
+    pending_.func       = func;
+    pending_.start_addr = start_addr;
+    pending_.reg_count  = reg_count;
+}
+
+uint16_t SerialTask::inputReg(uint16_t addr) const
+{
+    if (addr >= SlaveRegisters::SIZE) return 0;
+    std::lock_guard<std::mutex> lock(mtx_);
+    return regs_.input_regs[addr];
+}
+
+uint16_t SerialTask::holdingReg(uint16_t addr) const
+{
+    if (addr >= SlaveRegisters::SIZE) return 0;
+    std::lock_guard<std::mutex> lock(mtx_);
+    return regs_.holding_regs[addr];
+}
+
 void SerialTask::recvThread_()
 {
     // 绑定 CPU 核（bind_cpu）
@@ -110,7 +133,7 @@ void SerialTask::recvThread_()
 
     // 事件驱动接收循环：select 阻塞等待数据，有数据立刻返回
     // 100ms 超时仅用于周期性检查 running_ 标志，以便优雅退出
-    uint8_t buf[64];
+    uint8_t buf[256];   // 与 ADU 上限一致（addr + func + data + crc2 = 256）
     while (running_.load())
     {
         uint64_t ts = 0;
@@ -121,7 +144,8 @@ void SerialTask::recvThread_()
     }
 }
 
-//原始数据解析（含 CRC 校验，校验失败直接丢弃，不更新 recv_obj_）
+// 解析一帧：先 CRC 校验，通过后组装 ModbusFrame，再按功能码把数据
+// 组合成 16 位寄存器写入寄存器表。任何异常都直接丢弃，不污染寄存器表。
 void SerialTask::parseFrame_(const uint8_t* buf, size_t len, uint64_t ts)
 {
     if (len < 2) return;
@@ -133,15 +157,15 @@ void SerialTask::parseFrame_(const uint8_t* buf, size_t len, uint64_t ts)
     size_t crc_len = 0;   // CRC 覆盖字节数（addr .. data 区，不含 CRC 本身）
     size_t crc_pos = 0;   // CRC 低字节在 buf 中的下标
 
-    if (funcode == 0x04) {
-        // 读应答：addr + 04 + 字节数N + data[N] + crc(2)
+    if (funcode == 0x03 || funcode == 0x04) {
+        // 读应答：addr + func + 字节数N + data[N] + crc(2)
         if (len < 3) return;
         uint8_t n = buf[2];
         crc_len   = 3 + n;
         crc_pos   = 3 + n;
     }
     else if (funcode == 0x06 || funcode == 0x10) {
-        // 写应答：addr + funcode + 回显4字节 + crc(2)
+        // 写应答：addr + func + 回显4字节 + crc(2)
         crc_len = 6;
         crc_pos = 6;
     }
@@ -164,28 +188,68 @@ void SerialTask::parseFrame_(const uint8_t* buf, size_t len, uint64_t ts)
         return;
     }
 
-    // 校验通过，写入 recv_obj_
-    recv_obj_.addr    = addr;
-    recv_obj_.funcode = funcode;
-    recv_obj_.recv_ns = ts;
-    recv_obj_.crc     = crc_rx;
+    // ---- CRC 通过，组装通信层帧（不含 CRC）----
+    ModbusFrame frame;
+    frame.addr = addr;
+    frame.func = funcode;
+    frame.len  = (uint8_t)(crc_len - 2);          // 去掉 addr + func
+    if (frame.len > sizeof(frame.data)) return;   // 理论上不会发生
+    memcpy(frame.data, buf + 2, frame.len);
 
-    if (funcode == 0x04) {
-        uint8_t n = buf[2];
-        recv_obj_.datalen = (n > sizeof(recv_obj_.data)) ? sizeof(recv_obj_.data) : n;
-        memcpy(recv_obj_.data, buf + 3, recv_obj_.datalen);
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    if (funcode == 0x03 || funcode == 0x04) {
+        // 读应答：frame.data = 字节数N + data[N]，无起始地址，靠 pending_ 定位
+        uint8_t n = frame.data[0];
+        if (!pending_.active || pending_.func != funcode) {
+            std::cerr << "[SerialTask] 读应答与待处理请求不匹配，丢弃\n";
+            return;
+        }
+
+        uint16_t start = pending_.start_addr;
+        uint16_t nreg  = n / 2;                    // 寄存器个数
+        if ((n & 1) || nreg != pending_.reg_count) {
+            std::cerr << "[SerialTask] 读应答寄存器数量不符: 期望 " << pending_.reg_count
+                      << "，实际 " << nreg << "，丢弃\n";
+            return;
+        }
+        if ((size_t)start + nreg > SlaveRegisters::SIZE) {
+            std::cerr << "[SerialTask] 寄存器地址越界，丢弃\n";
+            return;
+        }
+
+        uint16_t* dst = (funcode == 0x04) ? regs_.input_regs : regs_.holding_regs;
+        for (uint16_t i = 0; i < nreg; ++i)
+            dst[start + i] = ((uint16_t)frame.data[1 + 2 * i] << 8) | frame.data[2 + 2 * i];  // 大端
+
+        pending_.active = false;
+
+        std::cout << "[RX] addr=" << (int)addr << " func=0x" << std::hex << (int)funcode
+                  << std::dec << " start=" << start << " nreg=" << nreg
+                  << " ts=" << ts << "ns:";
+        for (uint16_t i = 0; i < nreg; ++i)
+            std::cout << " " << std::hex << std::setw(4) << std::setfill('0') << dst[start + i];
+        std::cout << std::dec << "\n";
     }
-    else { // 0x06 / 0x10
-        recv_obj_.datalen = 4;
-        memcpy(recv_obj_.data, buf + 2, 4);
+    else if (funcode == 0x06) {
+        // 写单寄存器应答：回显 addr + func + reg_addr(2) + value(2)
+        uint16_t reg = ((uint16_t)frame.data[0] << 8) | frame.data[1];
+        uint16_t val = ((uint16_t)frame.data[2] << 8) | frame.data[3];
+        if (reg < SlaveRegisters::SIZE) regs_.holding_regs[reg] = val;
+        pending_.active = false;
+
+        std::cout << "[RX] addr=" << (int)addr << " func=0x06 reg=" << reg
+                  << " val=" << val << " ts=" << ts << "ns\n";
+    }
+    else { // 0x10
+        // 写多寄存器应答：回显 addr + func + start(2) + count(2)，仅确认成功
+        uint16_t start = ((uint16_t)frame.data[0] << 8) | frame.data[1];
+        uint16_t count = ((uint16_t)frame.data[2] << 8) | frame.data[3];
+        pending_.active = false;
+
+        std::cout << "[RX] addr=" << (int)addr << " func=0x10 start=" << start
+                  << " count=" << count << " ts=" << ts << "ns\n";
     }
 
-    // 调试打印（按需删除）
-    std::cout << "[RX] addr=" << (int)recv_obj_.addr
-              << " func=0x" << std::hex << std::setw(2) << std::setfill('0') << (int)recv_obj_.funcode
-              << std::dec << " datalen=" << (int)recv_obj_.datalen
-              << " ts=" << recv_obj_.recv_ns << "ns";
-    for (uint8_t i = 0; i < recv_obj_.datalen; ++i)
-        std::cout << " " << std::hex << std::setw(2) << std::setfill('0') << (int)recv_obj_.data[i];
-    std::cout << std::dec << "\n";
+    last_recv_ns_ = ts;
 }
