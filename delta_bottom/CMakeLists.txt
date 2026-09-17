@@ -46,10 +46,16 @@ target_link_libraries(common PUBLIC
 add_subdirectory(drives)
 
 # ---------------------------------------------------------------------------
+# comm: 共享内存通信（SharedMemory）
+# ---------------------------------------------------------------------------
+add_subdirectory(comm)
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 add_executable(delta_bottom user/main.cpp)
 target_link_libraries(delta_bottom PRIVATE
   common
   drives
+  comm
 )

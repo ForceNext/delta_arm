@@ -42,4 +42,5 @@ public:
 
     // 清空接收缓冲（每次发帧前调用，防止残留字节导致帧错位）
     void flushInput();
+    bool Get_SerialOpened(){return serial_opened_;}
 };

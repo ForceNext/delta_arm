@@ -9,6 +9,7 @@
 #include <cerrno>
 
 #include "modbus_master.hpp"
+#include "shared_memory.h"
 #include "yaml-cpp/yaml.h"
 
 // ---------------------------------------------------------------------------
@@ -22,12 +23,12 @@ namespace Cmd {
     constexpr uint16_t ENABLE     = 0x00FA;  // 使能：0=使能 / 1=失能
 }
 
-// 一圈（360°）对应的位置计数：协议规定 51200 = 一圈
-constexpr double REV = 51200.0;
-
 // 运动参数（来自上位机实测）：加减速 200，速度 1000 RPM
 constexpr uint8_t  MOVE_ACCEL = 200;
 constexpr uint16_t MOVE_SPEED = 1000;
+
+// 角度（度）→ 电机计数：51200 = 一圈 360°
+constexpr double DEG2CNT = 51200.0 / 360.0;
 
 static std::vector<uint8_t> g_cfg_addr = {1, 2, 3};  // 配置里的所有从站地址
 static std::vector<uint8_t> g_addr;                  // 实际在线、要控制的从站地址
@@ -79,15 +80,17 @@ static void sleepUntil(const std::chrono::steady_clock::time_point& next)
 int main(int argc, char** argv)
 {
     std::signal(SIGINT, onSigInt);
-    std::cout << std::unitbuf;            // 关闭输出缓冲，让日志实时可见
+    std::cout << std::unitbuf;
 
     SerialPort port(argc, argv);          // 打开串口（读 hardware_config.yaml）
     ModbusMaster master(port);
-    master.resp_timeout_ms = 20;          // 缩短应答超时，加快探测/出错恢复
+    master.resp_timeout_ms = 20;
 
     const std::string cfg = (argc > 1) ? argv[1] : "configs/hardware_config.yaml";
     loadMotorAddrs(cfg);
     detectMotors(master);
+
+    SharedMemory shm;                     // 共享内存（默认名称 / 信号量 key）
 
     // 启动时使能所有在线电机（0=使能）
     for (uint8_t a : g_addr)
@@ -96,48 +99,65 @@ int main(int argc, char** argv)
     const double freq = 200.0;            // 控制频率 200Hz
     const auto period = std::chrono::nanoseconds((long long)(1e9 / freq));
 
-    std::cout << "开始 200Hz 控制循环（每 1s 转一圈，Ctrl-C 退出不刹车）\n";
+    std::cout << "开始 200Hz 控制循环（读共享内存 xyz 作为三个目标角度，单位：度）\n";
 
     auto start = std::chrono::steady_clock::now();
     auto next  = start;
     uint64_t cycle = 0;
 
     while (g_running) {
-        // 目标位置 = 一圈/s 匀速旋转（51200 计数/s），按真实运行时间算
-        double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        uint32_t pos = (uint32_t)std::lround(REV * t);
+        // 1) 读上位机命令：xyz 直接作为三个电机的目标角度（mode=1 时生效）
+        ArmCommand cmd;
+        shm.readCommand(cmd);
 
-        for (size_t i = 0; i < g_addr.size(); ++i) {
-            // 组 0xF2 闭环绝对位置命令：方向(1)+加减速(1)+速度(2)+位置(4) = 8 字节 = 4 寄存器
-            uint16_t regs[4];
-            regs[0] = (uint16_t)((0x00 << 8) | MOVE_ACCEL);   // 方向 0=正转 | 加减速
-            regs[1] = MOVE_SPEED;                             // 速度 RPM
-            regs[2] = (uint16_t)(pos >> 16);                  // 位置高 16 位
-            regs[3] = (uint16_t)(pos & 0xFFFF);               // 位置低 16 位
+        // 2) 角度 → 电机计数，逐台下发
+        double target[3] = {cmd.x, cmd.y, cmd.z};
+        uint32_t counts[3] = {0, 0, 0};
+        for (int i = 0; i < 3; ++i)
+            counts[i] = (uint32_t)llround(target[i] * DEG2CNT);
 
-            if (!master.writeRegisters(g_addr[i], Cmd::ABS_POS, 4, regs))
-                ++g_err[i];
+        if (cmd.mode == 1) {
+            for (size_t i = 0; i < g_addr.size() && i < 3; ++i) {
+                uint16_t regs[4];
+                regs[0] = (uint16_t)((0x00 << 8) | MOVE_ACCEL);  // 方向 0=正转 | 加减速
+                regs[1] = MOVE_SPEED;                            // 速度 RPM
+                regs[2] = (uint16_t)(counts[i] >> 16);
+                regs[3] = (uint16_t)(counts[i] & 0xFFFF);
+
+                if (!master.writeRegisters(g_addr[i], Cmd::ABS_POS, 4, regs))
+                    ++g_err[i];
+            }
         }
 
-        // 周期统计：打印实际循环频率、各电机实际转速与错误计数
-        if (++cycle % 200 == 0) {
+        // 3) 发布状态（简单版：在线 + 目标位置 + 回显坐标）
+        {
+            ArmStatus st{};
+            st.seq = cycle;
+            st.state = (cmd.mode == 1) ? 1 : 0;
+            for (size_t i = 0; i < g_addr.size() && i < 3; ++i) {
+                st.online[i] = 1;
+                st.theta[i] = target[i];
+                st.motor_pos[i] = (double)counts[i];
+            }
+            st.x = cmd.x; st.y = cmd.y; st.z = cmd.z;
+            shm.writeStatus(st);
+        }
+
+        ++cycle;
+
+        // 4) 周期统计
+        if (cycle % 200 == 0) {
             double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
             std::cout << "[cycle " << cycle << "] 实际频率 " << (cycle / elapsed) << " Hz";
-            for (size_t i = 0; i < g_addr.size(); ++i) {
-                uint16_t s = 0;
-                int16_t rpm = 0;
-                if (master.readInputRegisters(g_addr[i], Cmd::READ_SPEED, 1, &s))
-                    rpm = (int16_t)s;                       // int16 有符号，单位 RPM
-                std::cout << "  电机" << (int)g_addr[i] << " 转速=" << rpm
-                          << " RPM 错误=" << g_err[i];
-            }
+            for (size_t i = 0; i < g_addr.size(); ++i)
+                std::cout << "  电机" << (int)g_addr[i] << "错误=" << g_err[i];
             std::cout << "\n";
         }
 
-        // 睡到下一个绝对周期边界
+        // 5) 睡到下一个绝对周期边界
         auto now = std::chrono::steady_clock::now();
         next += period;
-        if (next < now) next = now + period;   // 发生过载，跳到下一拍
+        if (next < now) next = now + period;
         sleepUntil(next);
     }
 

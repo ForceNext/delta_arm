@@ -4,22 +4,17 @@ serial:
 
 motors:
   - addr: 1
-    name: "joint_base"
-    speed_rpm: 500
-    accel: 50
-    limit_min: -512000
-    limit_max: 512000
+    name: "motor_1"
+    speed_rpm: 1000
+    accel: 200
 
   - addr: 2
-    name: "joint_shoulder"
-    speed_rpm: 300
-    accel: 30
-    limit_min: -256000
-    limit_max: 256000
+    name: "motor_2"
+    speed_rpm: 1000
+    accel: 200
 
   - addr: 3
-    name: "joint_elbow"
-    speed_rpm: 800
-    accel: 80
-    limit_min: -128000
-    limit_max: 128000
+    name: "motor_3"
+    speed_rpm: 1000
+    accel: 200
+
