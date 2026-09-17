@@ -189,7 +189,7 @@ ssize_t SerialPort::write(const std::vector<uint8_t>& data)
     return write(data.data(), data.size());
 }
 
-ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms, uint64_t* first_byte_ns) {
+ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms, uint64_t* first_byte_ns, int byte_timeout_ms) {
     if (fd_ < 0) return -1;
 
     size_t total = 0;
@@ -228,8 +228,8 @@ ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms, uint64_t* 
 
         total += n;
         // 收到首个字节后，把超时缩短，用于等待帧内剩余字节
-        // 帧内字节间隔远小于 20ms，超时说明帧已结束
-        timeout_ms = 20;
+        // 帧内字节间隔远小于 byte_timeout_ms，超时说明帧已结束
+        timeout_ms = byte_timeout_ms;
     }
     return (ssize_t)total;
 }

@@ -1,75 +1,120 @@
 #include <iostream>
-#include <iomanip>
 #include <vector>
-#include <thread>
+#include <cmath>
+#include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cstdint>
-#include "serial_task.hpp"
+#include <ctime>
+#include <cerrno>
 
-// CRC-16/MODBUS（与 serial_task.cpp 内的实现一致；发送侧组帧用，之后可提到公共头复用）
-static uint16_t crc16Modbus(const uint8_t* data, size_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; ++b)
-            crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
-    }
-    return crc;
+#include "modbus_master.hpp"
+#include "yaml-cpp/yaml.h"
+
+// ---------------------------------------------------------------------------
+// 正点原子 PDxxS1 命令码：驱动把「寄存器起始地址」当作命令码用（高字节补 0），
+// 读写都走标准 Modbus 帧（读=0x03/0x04，写=0x06/0x10）。
+// ---------------------------------------------------------------------------
+namespace Cmd {
+    constexpr uint16_t READ_POS     = 0x002A;  // 读实时位置（int32，51200=一圈）
+    constexpr uint16_t READ_STATE   = 0x002C;  // 读运行状态
+    constexpr uint16_t ABS_POS_OPEN = 0x00E1;  // 开环绝对位置：方向(1)+加减速(1)+速度(2)+位置(4)
+    constexpr uint16_t ABS_POS      = 0x00F2;  // 绝对位置模式（闭环），字段顺序需对照手册确认
+    constexpr uint16_t ENABLE       = 0x00FA;  // 使能：0=使能 / 1=失能（参数按手册确认）
+    constexpr uint16_t STOP         = 0x00FC;  // 立即停止（刹车）
 }
 
-// 组读寄存器请求帧：addr + func + start(2) + count(2) + crc(2)
-static std::vector<uint8_t> makeReadReq(uint8_t addr, uint8_t func, uint16_t start, uint16_t count)
+constexpr double PI = 3.14159265358979323846;
+
+// 3 台电机从站地址（来自 configs/hardware_config.yaml 的 motors[].addr，解析失败用默认）
+static std::vector<uint8_t> g_addr = {1, 2, 3};
+static uint64_t g_err[3] = {0, 0, 0};          // 每台累计失败次数
+static std::atomic<bool> g_running{true};
+
+static void onSigInt(int) { g_running = false; }
+
+// 从 yaml 读电机地址
+static void loadMotorAddrs(const std::string& path)
 {
-    std::vector<uint8_t> f = {
-        addr, func,
-        (uint8_t)(start >> 8), (uint8_t)(start & 0xFF),
-        (uint8_t)(count >> 8), (uint8_t)(count & 0xFF),
-    };
-    uint16_t crc = crc16Modbus(f.data(), f.size());
-    f.push_back((uint8_t)(crc & 0xFF));   // CRC 低字节在前
-    f.push_back((uint8_t)(crc >> 8));
-    return f;
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        std::vector<uint8_t> a;
+        for (const auto& m : root["motors"])
+            a.push_back((uint8_t)m["addr"].as<int>());
+        if (a.size() >= 3) g_addr = a;
+    } catch (const std::exception& e) {
+        std::cerr << "读取电机地址失败(" << e.what() << ")，使用默认 {1,2,3}\n";
+    }
+}
+
+// 绝对时间睡眠到 next（CLOCK_MONOTONIC + TIMER_ABSTIME，避免周期漂移）
+static void sleepUntil(const std::chrono::steady_clock::time_point& next)
+{
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  next.time_since_epoch()).count();
+    struct timespec ts{ns / 1000000000LL, ns % 1000000000LL};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {}
 }
 
 int main(int argc, char** argv)
 {
-    SerialPort port(argc, argv);   // 打开串口
-    SerialTask task(port);         // 构造即启动接收线程
+    std::signal(SIGINT, onSigInt);
 
-    const uint8_t  slave = 0x01;   // 从站地址
-    const uint16_t start = 0x20;   // 版本号所在输入寄存器地址
-    const uint16_t count = 1;
+    SerialPort port(argc, argv);          // 打开串口（读 hardware_config.yaml）
+    ModbusMaster master(port);
 
-    // 1) 登记事务：告诉接收线程"接下来读输入寄存器 0x20，共 1 个"，
-    //    应答帧不含起始地址，接收线程据此把数据定位到寄存器表。
-    task.setPendingRequest(0x04, start, count);
+    const std::string cfg = (argc > 1) ? argv[1] : "configs/hardware_config.yaml";
+    loadMotorAddrs(cfg);
 
-    // 2) 组帧并发送
-    auto cmd = makeReadReq(slave, 0x04, start, count);
-    std::cout << "[TX] " << cmd.size() << " 字节:";
-    for (auto b : cmd)
-        std::cout << " " << std::hex << std::setw(2) << std::setfill('0') << (int)b;
-    std::cout << std::dec << "\n";
+    // 可选：先使能 3 台电机（参数按手册确认，0=使能）
+    // for (int i = 0; i < 3; ++i) master.writeRegister(g_addr[i], Cmd::ENABLE, 0x0000);
 
-    port.flushInput();   // 发送前清接收缓冲，防止残留字节
-    ssize_t n = port.write(cmd);
-    if (n != (ssize_t)cmd.size()) {
-        std::cerr << "发送失败：期望 " << cmd.size() << " 字节，实际 " << n << "\n";
-        return -1;
+    const double freq = 200.0;            // 控制频率 200Hz
+    const auto period = std::chrono::nanoseconds((long long)(1e9 / freq));
+
+    // 演示轨迹参数（占位：这里应替换成正逆解/轨迹规划结果）
+    const double center[3] = {5120.0, 5120.0, 5120.0};  // 偏移到非负区间（51200=一圈）
+    const double amp[3]    = {5120.0, 5120.0, 5120.0};  // 位置幅度（±0.1 圈）
+    const double omega[3]  = {1.0, 0.5, 0.8};           // 角频率 rad/s
+
+    std::cout << "开始 200Hz 控制循环（Ctrl-C 退出）: 电机地址 "
+              << (int)g_addr[0] << ',' << (int)g_addr[1] << ',' << (int)g_addr[2] << "\n";
+
+    auto next = std::chrono::steady_clock::now();
+    uint64_t cycle = 0;
+
+    while (g_running) {
+        // 1) 计算 3 台目标位置并逐台下发（失败跳过，不阻塞周期）
+        for (int i = 0; i < 3; ++i) {
+            double t = (double)cycle / freq;
+            int32_t pos = (int32_t)std::lround(center[i] + amp[i] * std::sin(2.0 * PI * omega[i] * t));
+
+            // 2) 组 0xE1 开环绝对位置命令：方向(1)+加减速(1)+速度(2)+位置(4) = 8 字节 = 4 寄存器
+            uint16_t regs[4];
+            regs[0] = 0x0000;                            // 方向 0=正转 | 加减速 0=直接启动
+            regs[1] = 100;                               // 速度 100 RPM
+            regs[2] = (uint16_t)((uint32_t)pos >> 16);   // 位置高 16 位
+            regs[3] = (uint16_t)((uint32_t)pos & 0xFFFF);// 位置低 16 位
+
+            if (!master.writeRegisters(g_addr[i], Cmd::ABS_POS_OPEN, 4, regs))
+                ++g_err[i];
+        }
+
+        // 3) 周期统计
+        if (++cycle % 1000 == 0) {
+            std::cout << "[cycle " << cycle << "] err="
+                      << g_err[0] << '/' << g_err[1] << '/' << g_err[2] << "\n";
+        }
+
+        // 4) 睡到下一个绝对周期边界
+        auto now = std::chrono::steady_clock::now();
+        next += period;
+        if (next < now) next = now + period;             // 发生过载，跳到下一拍
+        sleepUntil(next);
     }
 
-    // 3) 等待接收线程处理（验证用简单 sleep；生产环境应改为超时轮询/条件变量）
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-    // 4) 从寄存器表读结果，验证接收线程是否正确解析、校验并落地
-    uint16_t ver = task.inputReg(start);
-    std::cout << "[VERIFY] inputReg(0x" << std::hex << start << std::dec
-              << ") = " << ver << " (0x" << std::hex << ver << std::dec << ")\n";
-
-    uint64_t ns = task.lastRecvNs();
-    std::cout << "[VERIFY] lastRecvNs = " << ns
-              << (ns ? "  -> 已收到至少一帧应答" : "  -> 未收到任何有效应答") << "\n";
-
-    return 0;   // 析构 SerialTask 时自动 stop() 并回收接收线程
+    std::cout << "退出：停止 3 台电机\n";
+    for (int i = 0; i < 3; ++i)
+        master.writeRegister(g_addr[i], Cmd::STOP, 0x0001);
+    return 0;
 }
