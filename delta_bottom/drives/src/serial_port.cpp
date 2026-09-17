@@ -234,7 +234,38 @@ ssize_t SerialPort::read(uint8_t* buffer, size_t len, int timeout_ms, uint64_t* 
     return (ssize_t)total;
 }
 
-void SerialPort::flushInput() 
+ssize_t SerialPort::readExact(uint8_t* buffer, size_t len, int timeout_ms, int byte_timeout_ms) {
+    if (fd_ < 0) return -1;
+
+    size_t total = 0;
+    while (total < len) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd_, &rfds);
+
+        // 首字节用完整超时，后续字节用帧内字节间隔超时
+        int t = (total == 0) ? timeout_ms : byte_timeout_ms;
+        struct timeval tv{t / 1000, (t % 1000) * 1000};
+
+        int ret = select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return total > 0 ? (ssize_t)total : -1;
+        }
+        if (ret == 0) return total > 0 ? (ssize_t)total : -1;  // 超时且未读满
+
+        ssize_t n = ::read(fd_, buffer + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            return total > 0 ? (ssize_t)total : -1;
+        }
+        if (n == 0) return total > 0 ? (ssize_t)total : -1;
+        total += n;
+    }
+    return (ssize_t)total;
+}
+
+void SerialPort::flushInput()
 {
     if (fd_ >= 0) tcflush(fd_, TCIFLUSH);
 }

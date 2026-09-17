@@ -28,10 +28,11 @@ public:
     int byte_timeout_ms = 5;    // 帧内字节间隔
 
 private:
-    // 一次事务：发 req，等应答并校验 addr/func/CRC，成功后把「func+数据区」写入 rsp。
+    // 一次事务：发 req，按期望长度收应答并校验 addr/func/CRC，成功后把「func+数据区」写入 rsp。
+    // exp_len：期望的完整应答帧长度（含 addr 与 CRC），用于按长度精确收帧，避免帧尾静默等待。
     // 返回 0=成功, -1=超时/长度不足, -2=地址或功能码不匹配, -3=CRC 错, >0=从站异常码
     int transact_(const std::vector<uint8_t>& req, uint8_t addr, uint8_t func,
-                  std::vector<uint8_t>* rsp);
+                  uint16_t exp_len, std::vector<uint8_t>* rsp);
     bool readRegisters_(uint8_t addr, uint8_t func, uint16_t start, uint16_t count, uint16_t* out);
 
     SerialPort& port_;

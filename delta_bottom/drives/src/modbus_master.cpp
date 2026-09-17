@@ -25,36 +25,48 @@ void appendCrc(std::vector<uint8_t>& f)
 ModbusMaster::ModbusMaster(SerialPort& port) : port_(port) {}
 
 /**
- * @brief 执行一次完整事务：发送请求帧、等待应答并校验
+ * @brief 执行一次完整事务：发送请求帧、按期望长度接收应答并校验
  * @param req 待发送的请求帧（含 CRC）
  * @param addr 期望的从站地址
  * @param func 期望的功能码
+ * @param exp_len 期望的完整应答帧长度（含 addr 与 CRC），按此长度精确收帧
  * @param rsp 出参：成功时写入「func + 数据区」（去掉 addr 与 CRC）
  * @return 0=成功；-1=超时/长度不足；-2=地址或功能码不匹配；-3=CRC 错；>0=从站异常码
  * @note 校验顺序：帧长 → 从站地址 → 异常应答 → 功能码 → CRC，任何一步失败立即返回
  */
 int ModbusMaster::transact_(const std::vector<uint8_t>& req, uint8_t addr, uint8_t func,
-                            std::vector<uint8_t>* rsp)
+                            uint16_t exp_len, std::vector<uint8_t>* rsp)
 {
     port_.flushInput();                 // 发前清残留（RS485 半双工必须）
     port_.write(req);                   // 内部 tcdrain，保证发完再等应答
 
     uint8_t buf[256];
-    uint64_t ts = 0;
-    ssize_t n = port_.read(buf, sizeof(buf), resp_timeout_ms, &ts, byte_timeout_ms);
-    if (n < 4) return -1;               // 至少 addr + func + crc(2)
+    if (exp_len < 5 || exp_len > sizeof(buf)) return -1;
+
+    // 1) 读前 3 字节：addr + func + 第三字节
+    if (port_.readExact(buf, 3, resp_timeout_ms, byte_timeout_ms) < 3) return -1;
 
     if (buf[0] != addr) return -2;      // 从站地址不符
 
-    if (buf[1] == (uint8_t)(func | 0x80))  // 异常应答：func|0x80 + 异常码
-        return buf[2];
+    // 2) 异常应答：addr + func|0x80 + 异常码 + crc(2) = 5 字节
+    if (buf[1] == (uint8_t)(func | 0x80)) {
+        if (port_.readExact(buf + 3, 2, byte_timeout_ms, byte_timeout_ms) < 2) return -1;
+        uint16_t crc_rx = (uint16_t)(buf[3] | (buf[4] << 8));
+        if (crc16Modbus(buf, 3) != crc_rx) return -3;
+        return buf[2];                  // 返回异常码
+    }
 
     if (buf[1] != func) return -2;      // 功能码不符
 
-    uint16_t crc_rx = (uint16_t)(buf[n - 2] | (buf[n - 1] << 8));
-    if (crc16Modbus(buf, (size_t)(n - 2)) != crc_rx) return -3;
+    // 3) 读剩余字节到期望长度
+    if (port_.readExact(buf + 3, exp_len - 3, byte_timeout_ms, byte_timeout_ms) < (ssize_t)(exp_len - 3))
+        return -1;
 
-    if (rsp) rsp->assign(buf + 1, buf + (n - 2));  // 去 addr 与 CRC，留 func+数据区
+    // 4) CRC 校验
+    uint16_t crc_rx = (uint16_t)(buf[exp_len - 2] | (buf[exp_len - 1] << 8));
+    if (crc16Modbus(buf, exp_len - 2) != crc_rx) return -3;
+
+    if (rsp) rsp->assign(buf + 1, buf + (exp_len - 2));  // 去 addr 与 CRC，留 func+数据区
     return 0;
 }
 
@@ -78,9 +90,10 @@ bool ModbusMaster::readRegisters_(uint8_t addr, uint8_t func, uint16_t start,
     appendCrc(req);
 
     std::vector<uint8_t> rsp;
-    if (transact_(req, addr, func, &rsp) != 0) return false;
+    // 读应答：addr + func + 字节数 + data(count*2) + crc = 5 + count*2
+    if (transact_(req, addr, func, (uint16_t)(5 + count * 2), &rsp) != 0) return false;
 
-    // 读应答：func + 字节数N + data[N]
+    // 读应答数据区：func + 字节数N + data[N]
     if (rsp.size() < 2) return false;
     uint8_t n = rsp[1];
     if (n != count * 2 || rsp.size() < (size_t)(2 + n)) return false;
@@ -132,7 +145,8 @@ bool ModbusMaster::writeRegister(uint8_t addr, uint16_t reg, uint16_t val)
         (uint8_t)(val >> 8), (uint8_t)(val & 0xFF),
     };
     appendCrc(req);
-    return transact_(req, addr, 0x06, nullptr) == 0;
+    // 写应答：addr + func + 寄存器地址(2) + 值(2) + crc = 8 字节
+    return transact_(req, addr, 0x06, 8, nullptr) == 0;
 }
 
 /**
@@ -157,7 +171,8 @@ bool ModbusMaster::writeRegisters(uint8_t addr, uint16_t start, uint16_t count, 
         req.push_back((uint8_t)(vals[i] & 0xFF));
     }
     appendCrc(req);
-    return transact_(req, addr, 0x10, nullptr) == 0;
+    // 写应答：addr + func + 起始地址(2) + 数量(2) + crc = 8 字节
+    return transact_(req, addr, 0x10, 8, nullptr) == 0;
 }
 
 /**
