@@ -7,6 +7,108 @@ Delta 并联机械臂项目。目前实现下位机 `delta_bottom`，通过串�
 - **控制频率**：200 Hz
 - **通信协议**：Modbus RTU（`04H` 读输入寄存器 / `06H` 写单寄存器 / `10H` 写多寄存器）
 - **驱动器**：正点原子 PDxxS1 闭环步进驱动器（位置分辨率 `51200` = 一圈）
+- **上下位机通信**：POSIX 共享内存（`shm_open` + `mmap`），上位机发布末端坐标 xyz，底层发布机械臂状态
+- **解算**：底层在 200 Hz 循环内完成 delta 逆解（xyz → 三个关节角）
+
+## 系统架构（整体框架）
+
+本项目定位为**控制底层**：负责与电机通信、解算、下发指令；不负责轨迹规划与界面。系统由两个进程通过共享内存协作：
+
+```
+┌──────────────┐   共享内存（双向）   ┌────────────────────────────┐   Modbus RTU   ┌──────────┐
+│   上位机      │ ──────────────────▶ │        底层（本工程）        │ ─────────────▶ │ 电机 ×3  │
+│ 规划 / GUI    │                     │  200Hz：读命令 → 逆解 → 发指令 │               │ 驱动器   │
+│              │ ◀────────────────── │  读回状态 → 正解 → 发布状态    │ ◀───────────── │          │
+└──────────────┘                     └────────────────────────────┘                └──────────┘
+   发布 xyz                              发布关节角/实际位置/在线/错误
+```
+
+- **上位机**（独立进程，不在本工程内）：负责轨迹规划、人机界面，只发布**末端坐标 xyz**，订阅机械臂状态。
+- **底层**（本工程）：200 Hz 循环，读 xyz → **逆解出三个关节角** → 换算成电机位置计数 → 下发电机指令；同时读回实际状态 → 正解 → 发布状态。
+
+### 共享内存接口
+
+用 POSIX 共享内存（`shm_open` + `mmap`），一段内存分为两个区域，每个区域用 **seqlock** 保护（单写单读，读者永不阻塞，适合 200 Hz 实时循环）。
+
+`comm/shared_memory.h`（上位机与底层**共用同一份头文件**，保证内存布局一致）：
+
+```cpp
+struct ArmCommand {          // 上位机 → 底层
+    uint64_t seq;            // 写入序号（每次写 +1）
+    uint8_t  mode;           // 0=空闲 1=位置模式 2=回零 ...
+    double   x, y, z;        // 目标末端坐标（单位 mm）
+};
+
+struct ArmStatus {           // 底层 → 上位机
+    uint64_t seq;            // 写入序号
+    uint8_t  state;          // 运行状态 / 错误码
+    uint8_t  online[3];      // 各电机是否在线
+    double   theta[3];       // 实际关节角（rad）
+    double   motor_pos[3];   // 实际电机位置（计数）
+    double   x, y, z;        // 正解得到的实际末端坐标（mm）
+};
+
+struct SharedMemoryLayout {
+    struct { uint32_t lock; ArmCommand data; } command;  // lock 为奇数表示「正在写」
+    struct { uint32_t lock; ArmStatus  data; } status;
+};
+```
+
+- **写方**：`lock++`（变奇数）→ 写数据 → `lock++`（变偶数）。
+- **读方**：读 `lock`（奇数则自旋重试）→ 读数据 → 再读 `lock`，两次不一致则重读。
+
+### 底层 200 Hz 控制循环
+
+```cpp
+while (running) {
+    // 1. 读共享内存，取目标坐标（seqlock 读，不阻塞）
+    ArmCommand cmd = shm.readCommand();
+
+    // 2. 逆解：末端坐标 -> 三个关节角（delta 逆解为闭式解，微秒级）
+    double theta[3];
+    ik.solve(cmd.x, cmd.y, cmd.z, theta);
+
+    // 3. 关节角 -> 电机位置计数（含减速比、零点偏移、转向）
+    uint32_t motor_pos[3];
+    for (int i = 0; i < 3; ++i)
+        motor_pos[i] = mapping.jointToCounts(i, theta[i]);
+
+    // 4. 下发电机闭环绝对位置指令
+    for (int i = 0; i < 3; ++i)
+        master.writeRegisters(addr[i], Cmd::ABS_POS, 4, regs_of(motor_pos[i]));
+
+    // 5. 读回实际状态，正解出实际坐标，发布到共享内存
+    shm.writeStatus(buildStatus());
+
+    // 6. 睡到下一个 200 Hz 边界（clock_nanosleep 绝对时间）
+}
+```
+
+### 模块划分
+
+| 模块 | 目录 | 状态 | 职责 |
+| --- | --- | --- | --- |
+| `SerialPort` / `ModbusMaster` | `drives/` | ✅ 已有 | 电机通信（组帧/CRC/收发/校验） |
+| `SharedMemory` | `comm/` | 🚧 待实现 | `shm_open` + `mmap` + seqlock，读命令 / 写状态 |
+| `Kinematics` | `kinematics/` | 🚧 待实现 | delta 逆解 IK / 正解 FK |
+| `MotorMapping` | `kinematics/` | 🚧 待实现 | 关节角 ↔ 电机计数（减速比、零点、方向） |
+| `ControlLoop` | `control/` | 🚧 待实现 | 200 Hz 主循环，串联上述模块 |
+
+### 时序预算（200 Hz = 5 ms）
+
+| 步骤 | 耗时量级 |
+| --- | --- |
+| 读共享内存（seqlock） | ~1 µs |
+| 逆解 IK | ~1 µs（闭式解） |
+| 下发 3 台电机指令 | ~1~3 ms（921600 波特率，取决于从站应答） |
+| 读回状态 + 正解 + 发布 | ~0.5~1 ms |
+| **合计** | **~2~4 ms，余量充足** |
+
+### 同步与实时性
+
+- 控制路径**单线程**（实时优先级 + CPU 亲和），避免锁竞争；共享内存用 seqlock 保证读者永不阻塞。
+- 状态发布在控制循环内顺带完成即可；若需更慢的遥测日志，可另开低优先级线程（后续需要时再加）。
+- 上位机与底层**解耦**：底层不关心轨迹如何生成，只消费 xyz、发布状态。
 
 ## 项目结构
 
