@@ -9,7 +9,7 @@
 #include <cerrno>
 
 #include "modbus_master.hpp"
-#include "shared_memory.h"
+#include "Utilities/SharedMemory.h"
 #include "yaml-cpp/yaml.h"
 
 // ---------------------------------------------------------------------------
@@ -90,7 +90,8 @@ int main(int argc, char** argv)
     loadMotorAddrs(cfg);
     detectMotors(master);
 
-    SharedMemory shm;                     // 共享内存（默认名称 / 信号量 key）
+    ArmSharedMemory shm;                  // 共享内存（命令/状态 + 信号量互斥）
+    shm.connect();                        // 连接：首次创建，其余附加
 
     // 启动时使能所有在线电机（0=使能）
     for (uint8_t a : g_addr)

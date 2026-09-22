@@ -1,148 +1,94 @@
 /*! @file SharedMemory.h
- *  @brief Shared memory utilities for connecting the simulator program to the
- * robot program
+ *  @brief delta_arm 上下位机共享内存
  *
+ *  基于 POSIX shm_open 的 SharedMemoryObject 模板，
+ *  读写互斥锁用 System V 信号量 sem_com（Utilities/sem_com.h）管理。
  *
+ *  底层（delta_bottom）与上位机共用同一块共享内存：
+ *    上位机写入 ArmCommand，底层读取并下发。
+ *
+ *  当前阶段（暂不做运动学解算）：
+ *    x -> 电机 id1 目标角度（度）
+ *    y -> 电机 id2 目标角度（度）
+ *    z -> 电机 id3 目标角度（度）
  */
-#ifndef PROJECT_SHAREDMEMORY_H
-#define PROJECT_SHAREDMEMORY_H
+#ifndef PROJECT_SHARED_MEMORY_H
+#define PROJECT_SHARED_MEMORY_H
 
 #include <fcntl.h>
-#include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 
-#include "cTypes.h"
+#include "Utilities/sem_com.h"
 
+// 共享内存名称（shm_open 的名字须以 '/' 开头）
+#define ARM_SHARED_MEMORY_NAME "/delta_arm"
 
-#define DEVELOPMENT_SIMULATOR_SHARED_MEMORY_NAME "development-simulator"
+// System V 信号量 key（上下位机必须使用同一个 key，任意非零整数，避免与其他程序冲突）
+#define ARM_SEM_KEY 0x5A11
 
-/*!
- * A POSIX semaphore for shared memory.
- * See https://linux.die.net/man/7/sem_overview for more deatils
- */
-class SharedMemorySemaphore {
- public:
-  /*!
-   * If semaphore is unitialized, initialize it and set its value.  This can be
-   * called as many times as you want safely. It must be called at least once.
-   * Only one process needs to call this, even if it is used in multiple
-   * processes.
-   *
-   * Note that if init() is called after the semaphore has been initialized, it
-   * will not change its value.
-   * @param value The initial value of the semaphore.
-   */
-  void init(unsigned int value) {
-    if (!_init) {
-      if (sem_init(&_sem, 1, value)) {
-        printf("[ERROR] Failed to initialize shared memory semaphore: %s\n",
-               strerror(errno));
-      } else {
-        _init = true;
-      }
-    }
-  }
+// 上位机 -> 底层：命令（xyz 直接作为三个电机的目标角度，单位：度）
+struct ArmCommand {
+  uint64_t seq = 0;   // 写入序号（每次写 +1）
+  uint8_t mode = 0;   // 0=空闲  1=位置模式（把 xyz 当角度下发）
+  double x = 0.0;     // 电机 id1 目标角度（度）
+  double y = 0.0;     // 电机 id2 目标角度（度）
+  double z = 0.0;     // 电机 id3 目标角度（度）
+};
 
-  /*!
-   * Increment the value of the semaphore.
-   */
-  void increment() { sem_post(&_sem); }
+// 底层 -> 上位机：状态
+struct ArmStatus {
+  uint64_t seq = 0;                  // 写入序号
+  uint8_t state = 0;                 // 0=空闲 1=运行
+  uint8_t online[3] = {0, 0, 0};     // 各电机在线标志
+  double theta[3] = {0, 0, 0};       // 实际下发的三个目标角度（度）
+  double motor_pos[3] = {0, 0, 0};   // 实际下发的电机位置（计数）
+  double x = 0.0, y = 0.0, z = 0.0;  // 回显坐标
+};
 
-  /*!
-   * If the semaphore's value is > 0, decrement the value.
-   * Otherwise, wait until its value is > 0, then decrement.
-   */
-  void decrement() { sem_wait(&_sem); }
-
-  /*!
-   * If the semaphore's value is > 0, decrement the value and return true
-   * Otherwise, return false (doesn't decrement or wait)
-   * @return
-   */
-  bool tryDecrement() { return (sem_trywait(&_sem)) == 0; }
-
-  /*!
-   * Like decrement, but after waiting ms milliseconds, will give up
-   * Returns true if the semaphore is successfully decremented
-   */
-  bool decrementTimeout(u64 seconds, u64 nanoseconds) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += nanoseconds;
-    ts.tv_sec += seconds;
-    ts.tv_sec += ts.tv_nsec / 1000000000;
-    ts.tv_nsec %= 1000000000;
-#ifdef linux
-    return (sem_timedwait(&_sem, &ts) == 0);
-#else
-    return (sem_trywait(&_sem) == 0);
-#endif
-  }
-
-  /*!
-   * Delete the semaphore.  Note that deleting a semaphore in one process while
-   * another is still using it results in very strange behavior.
-   */
-  void destroy() { sem_destroy(&_sem); }
-
- private:
-  sem_t _sem;
-  bool _init = false;
+// 共享内存布局：锁不放在这里 —— sem_com 是独立的 System V 信号量，用 key 标识，
+// 不在共享内存块内部。
+struct ArmSharedData {
+  ArmCommand command;
+  ArmStatus status;
 };
 
 /*!
- * A container class for an object which is stored in shared memory.  This
- * object can then be viewed in multiple processes or programs.  Note that there
- * is significant overhead when creating a shared memory object, so it is
- * recommended that two programs that communicate should have one single large
- * SharedMemoryObject instead of many small ones.
- *
- * A name string is used to identify shared objects across different programs
- *
- * Before a shared memory object can be used, you must either allocate new
- * memory, or connect it to an existing shared memory object.
- *
- * Creating/deleting the memory can be done with createNew/closeNew.
- * Viewing an existing object allocated with createNew can be done with
- * attach/detach
- *
- * For an example, see test_sharedMemory.cpp
+ * 基于 POSIX shm_open 的共享内存对象模板（仿照原 SharedMemory.h）。
+ * 用名字字符串标识，可被多个进程同时映射。
+ * createNew 分配新内存，attach 附加已存在的对象。
  */
 template <typename T>
 class SharedMemoryObject {
  public:
   SharedMemoryObject() = default;
+  ~SharedMemoryObject() {
+    if (_data) detach();
+  }
 
   /*!
-   * Allocate memory for the shared memory object and attach to it.
-   * If allowOverwrite is true, and there's already an object with this name,
-   * the old object is overwritten Note that if this happens, the object may be
-   * initialized in a very weird state.
-   *
-   * Otherwise, if an object with the name already exists, throws a
-   * std::runtime_error
+   * 分配共享内存并映射。若同名对象已存在，allowOverwrite 为 false 时抛异常。
    */
   bool createNew(const std::string& name, bool allowOverwrite = false) {
     bool hadToDelete = false;
     assert(!_data);
     _name = name;
     _size = sizeof(T);
-    printf("[Shared Memory] open new %s, size %ld bytes\n", name.c_str(),
-           _size);
+    printf("[Shared Memory] open new %s, size %zu bytes\n", name.c_str(), _size);
 
-    _fd = shm_open(name.c_str(), O_RDWR | O_CREAT, 
+    _fd = shm_open(name.c_str(), O_RDWR | O_CREAT,
                    S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH);
-     if (_fd == -1) {
-      printf("[ERROR] SharedMemoryObject shm_open failed: %s\n",
-             strerror(errno));
+    if (_fd == -1) {
+      printf("[ERROR] SharedMemoryObject shm_open failed: %s\n", strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return false;
     }
 
     struct stat s;
@@ -150,28 +96,23 @@ class SharedMemoryObject {
       printf("[ERROR] SharedMemoryObject::createNew(%s) stat: %s\n",
              name.c_str(), strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return false;
     }
 
     if (s.st_size) {
-      printf(
-          "[Shared Memory] SharedMemoryObject::createNew(%s) on something that "
-          "wasn't new (size is %ld bytes)\n",
-          _name.c_str(), s.st_size);
+      printf("[Shared Memory] SharedMemoryObject::createNew(%s) on something "
+             "that wasn't new (size is %ld bytes)\n",
+             _name.c_str(), s.st_size);
       hadToDelete = true;
       if (!allowOverwrite)
         throw std::runtime_error(
             "Failed to create shared memory - it already exists.");
-
       printf("\tusing existing shared memory!\n");
-      // return false;
     }
 
     if (ftruncate(_fd, _size)) {
-      printf("[ERROR] SharedMemoryObject::createNew(%s) ftruncate(%ld): %s\n",
+      printf("[ERROR] SharedMemoryObject::createNew(%s) ftruncate(%zu): %s\n",
              name.c_str(), _size, strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return false;
     }
 
     void* mem =
@@ -180,12 +121,9 @@ class SharedMemoryObject {
       printf("[ERROR] SharedMemory::createNew(%s) mmap fail: %s\n",
              _name.c_str(), strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return false;
     }
 
-    // there is a chance that the shared memory is not zeroed if we are reusing
-    // old memory. this causes all sorts of weird issues, especially if the
-    // layout of the object in memory has changed.
+    // 复用旧内存时可能不是全零，统一清零，避免布局变化导致脏数据
     memset(mem, 0, _size);
 
     _data = (T*)mem;
@@ -193,13 +131,13 @@ class SharedMemoryObject {
   }
 
   /*!
-   * Attach to an existing shared memory object.
+   * 附加到一个已存在的共享内存对象。
    */
   void attach(const std::string& name) {
     assert(!_data);
     _name = name;
     _size = sizeof(T);
-    printf("[Shared Memory] open existing %s size %ld bytes\n", name.c_str(),
+    printf("[Shared Memory] open existing %s size %zu bytes\n", name.c_str(),
            _size);
     _fd = shm_open(name.c_str(), O_RDWR,
                    S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH);
@@ -207,7 +145,6 @@ class SharedMemoryObject {
       printf("[ERROR] SharedMemoryObject::attach shm_open(%s) failed: %s\n",
              _name.c_str(), strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return;
     }
 
     struct stat s;
@@ -215,17 +152,13 @@ class SharedMemoryObject {
       printf("[ERROR] SharedMemoryObject::attach(%s) stat: %s\n", name.c_str(),
              strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return;
     }
 
     if ((size_t)s.st_size != _size) {
-      printf(
-          "[ERROR] SharedMemoryObject::attach(%s) on something that was "
-          "incorrectly "
-          "sized (size is %ld bytes, should be %ld)\n",
-          _name.c_str(), s.st_size, _size);
+      printf("[ERROR] SharedMemoryObject::attach(%s) on something that was "
+             "incorrectly sized (size is %ld bytes, should be %zu)\n",
+             _name.c_str(), s.st_size, _size);
       throw std::runtime_error("Failed to create shared memory!");
-      return;
     }
 
     void* mem =
@@ -234,78 +167,34 @@ class SharedMemoryObject {
       printf("[ERROR] SharedMemory::attach(%s) mmap fail: %s\n", _name.c_str(),
              strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
-      return;
     }
 
     _data = (T*)mem;
   }
 
   /*!
-   * Free memory associated with the current open shared memory object.  The
-   * object could have been opened with either attach or createNew.  After
-   * calling this, no process can use this shared object
-   */
-  void closeNew() {
-    assert(_data);
-    // first, unmap
-    if (munmap((void*)_data, _size)) {
-      printf("[ERROR] SharedMemoryObject::closeNew (%s) munmap %s\n",
-             _name.c_str(), strerror(errno));
-      throw std::runtime_error("Failed to create shared memory!");
-      return;
-    }
-
-    _data = nullptr;
-
-    if (shm_unlink(_name.c_str())) {
-      printf("[ERROR] SharedMemoryObject::closeNew (%s) shm_unlink %s\n",
-             _name.c_str(), strerror(errno));
-      throw std::runtime_error("Failed to create shared memory!");
-      return;
-    }
-
-    // close fd
-    if (close(_fd)) {
-      printf("[ERROR] SharedMemoryObject::closeNew (%s) close %s\n",
-             _name.c_str(), strerror(errno));
-      throw std::runtime_error("Failed to create shared memory!");
-      return;
-    }
-
-    _fd = 0;
-  }
-
-  /*!
-   * Close this view of the currently opened shared memory object. The object
-   * can be opened with either attach or createNew.  After calling this, this
-   * process can no longer use this shared object, but other processes still
-   * can.
+   * 关闭当前进程对共享内存的映射（不删除共享内存，其他进程仍可用）。
    */
   void detach() {
-    assert(_data);
-    // first, unmap
+    if (!_data) return;
+
     if (munmap((void*)_data, _size)) {
       printf("[ERROR] SharedMemoryObject::detach (%s) munmap %s\n",
              _name.c_str(), strerror(errno));
-      throw std::runtime_error("Failed to create shared memory!");
-      return;
     }
-
     _data = nullptr;
 
-    // close fd
-    if (close(_fd)) {
-      printf("[ERROR] SharedMemoryObject::detach (%s) close %s\n",
-             _name.c_str(), strerror(errno));
-      throw std::runtime_error("Failed to create shared memory!");
-      return;
+    if (_fd >= 0) {
+      if (close(_fd)) {
+        printf("[ERROR] SharedMemoryObject::detach (%s) close %s\n",
+               _name.c_str(), strerror(errno));
+      }
+      _fd = -1;
     }
-
-    _fd = 0;
   }
 
   /*!
-   * Get the shared memory object.
+   * 获取共享内存对象指针。
    */
   T* get() {
     assert(_data);
@@ -313,7 +202,7 @@ class SharedMemoryObject {
   }
 
   /*!
-   * Get the shared memory object.
+   * 获取共享内存对象引用。
    */
   T& operator()() {
     assert(_data);
@@ -323,8 +212,60 @@ class SharedMemoryObject {
  private:
   T* _data = nullptr;
   std::string _name;
-  size_t _size;
-  int _fd;
+  size_t _size = 0;
+  int _fd = -1;
 };
 
-#endif  // PROJECT_SHAREDMEMORY_H
+/*!
+ * 上下位机共享内存访问封装：内部持有 System V 信号量锁（sem_com），
+ * 每次读写 command/status 前 sem_p() 加锁、之后 sem_v() 解锁。
+ */
+class ArmSharedMemory {
+ public:
+  // 构造时打开互斥锁（首次创建者初始化为 1，其余进程打开现有锁）
+  ArmSharedMemory() : lock_(ARM_SEM_KEY) {}
+
+  // 连接共享内存：首次启动的进程创建，其余附加
+  bool connect(const std::string& name = ARM_SHARED_MEMORY_NAME) {
+    try {
+      obj_.attach(name);  // 已存在则附加
+    } catch (const std::exception&) {
+      obj_.createNew(name);  // 不存在则创建
+    }
+    return true;
+  }
+
+  bool readCommand(ArmCommand& out) {
+    lock_.sem_p();
+    out = obj_.get()->command;
+    lock_.sem_v();
+    return true;
+  }
+
+  bool writeCommand(const ArmCommand& c) {
+    lock_.sem_p();
+    obj_.get()->command = c;
+    lock_.sem_v();
+    return true;
+  }
+
+  bool readStatus(ArmStatus& out) {
+    lock_.sem_p();
+    out = obj_.get()->status;
+    lock_.sem_v();
+    return true;
+  }
+
+  bool writeStatus(const ArmStatus& s) {
+    lock_.sem_p();
+    obj_.get()->status = s;
+    lock_.sem_v();
+    return true;
+  }
+
+ private:
+  SharedMemoryObject<ArmSharedData> obj_;
+  sem_com lock_;  // System V 信号量互斥锁（key = ARM_SEM_KEY）
+};
+
+#endif  // PROJECT_SHARED_MEMORY_H

@@ -25,15 +25,15 @@ set(YAML_CPP_INSTALL      OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/yaml-cpp)
 
 # ---------------------------------------------------------------------------
-# common library (third_party/common)
+# common library
 # ---------------------------------------------------------------------------
 add_library(common STATIC
-  third_party/common/src/Utilities/PeriodicTask.cpp
-  third_party/common/src/Utilities/utilities.cpp
-  third_party/common/src/Utilities/Utilities_print.cpp
+  common/src/Utilities/PeriodicTask.cpp
+  common/src/Utilities/utilities.cpp
+  common/src/Utilities/Utilities_print.cpp
 )
 target_include_directories(common PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/common/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/common/include
 )
 target_link_libraries(common PUBLIC
   Eigen3::Eigen
@@ -46,16 +46,10 @@ target_link_libraries(common PUBLIC
 add_subdirectory(drives)
 
 # ---------------------------------------------------------------------------
-# comm: 共享内存通信（SharedMemory）
-# ---------------------------------------------------------------------------
-add_subdirectory(comm)
-
-# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 add_executable(delta_bottom user/main.cpp)
 target_link_libraries(delta_bottom PRIVATE
   common
   drives
-  comm
 )
