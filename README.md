@@ -110,6 +110,76 @@ while (running) {
 - 状态发布在控制循环内顺带完成即可；若需更慢的遥测日志，可另开低优先级线程（后续需要时再加）。
 - 上位机与底层**解耦**：底层不关心轨迹如何生成，只消费 xyz、发布状态。
 
+## 上下位机通信（当前实现）
+
+> 以下为**已实现**的上下位机共享内存，与上文「系统架构」里规划的 seqlock 方案不同：
+> 当前用 **System V 信号量互斥锁**，且**暂不做运动学解算**——把上位机下发的 xyz 直接
+> 当作三个电机的目标角度（`x`→电机 id1、`y`→id2、`z`→id3，单位：度）。
+
+### 共享内存（`common/include/Utilities/SharedMemory.h`）
+
+上下位机**共用同一份头文件**，保证内存布局一致：
+
+```cpp
+#define ARM_SHARED_MEMORY_NAME "/delta_arm"   // POSIX 共享内存名（shm_open 名字须以 / 开头）
+#define ARM_SEM_KEY            0x5A11         // System V 信号量 key（上下位机必须一致）
+
+struct ArmCommand {          // 上位机 → 底层
+    uint64_t seq = 0;        // 写入序号（每次写 +1）
+    uint8_t  mode = 0;       // 0=空闲 1=位置模式
+    double   x = 0.0;        // 电机 id1 目标角度（度）
+    double   y = 0.0;        // 电机 id2 目标角度（度）
+    double   z = 0.0;        // 电机 id3 目标角度（度）
+};
+
+struct ArmStatus {           // 底层 → 上位机
+    uint64_t seq = 0;        // 写入序号
+    uint8_t  state = 0;      // 0=空闲 1=运行
+    uint8_t  online[3];      // 各电机在线标志
+    double   theta[3];       // 实际下发的目标角（度）
+    double   motor_pos[3];   // 实际下发的电机位置（计数）
+    double   x, y, z;        // 回显坐标
+};
+
+struct ArmSharedData {       // 共享内存整体布局（锁不放在块内）
+    ArmCommand command;
+    ArmStatus  status;
+};
+```
+
+- **共享内存**：POSIX `shm_open` + `mmap`，名字 `/delta_arm`。
+- **互斥锁**：独立的 System V 信号量（`common/include/Utilities/sem_com.h`），key = `0x5A11`，不在共享内存块内部。
+- **读写**：每次读/写 `command` 或 `status` 前 `sem_p()` 加锁、之后 `sem_v()` 解锁。
+- **首次创建**：信号量用 `IPC_CREAT | IPC_EXCL` 判断是否首次创建——首次创建者初始化为 1，其余进程只打开不重置；`SEM_UNDO` 保证进程异常退出时自动释放持有的锁。
+
+`ArmSharedMemory` 类封装了上述逻辑（见 `SharedMemory.h`）：
+
+```cpp
+ArmSharedMemory shm;           // 构造时打开信号量锁（key = ARM_SEM_KEY）
+shm.connect();                 // 首次创建 / 其余附加共享内存
+
+ArmCommand cmd;
+shm.readCommand(cmd);          // 底层读命令（加锁 → 读 → 解锁）
+ArmStatus st;
+shm.writeStatus(st);           // 底层写状态（加锁 → 写 → 解锁）
+```
+
+### 上位机模拟脚本（`tools/upper_sim.py`）
+
+真正的上位机就绪前，用 Python 脚本模拟上位机向共享内存写 xyz：
+
+```bash
+cd delta_bottom
+python3 tools/upper_sim.py            # x 轴(id1)每秒 1 圈
+python3 tools/upper_sim.py xyz        # x/y/z 三轴一起，每秒 1 圈
+python3 tools/upper_sim.py xy 2.0     # x/y 两轴，每秒 2 圈
+```
+
+- 先启动底层 `./build/delta_bottom`，再运行该脚本。
+- 脚本以 200 Hz 写入，角度按 `360 * rps / 200` 每拍累加；每秒打印各轴角度与底层回读的 `status.seq`（>0 表示链路已打通）。
+- 退出（Ctrl-C）时自动写 `mode=0`（空闲），底层停止下发。
+- 脚本用 `ctypes` 定义与 C++ 一致的 `ArmCommand/ArmStatus` 布局（共 128 字节），并用 System V 信号量（key `0x5A11`）加锁，与底层严格对齐。
+
 ## 项目结构
 
 ```
@@ -121,6 +191,11 @@ delta_arm/
     ├── configs/
     │   ├── hardware_config.yaml # 串口 + 电机列表
     │   └── thread_config.yaml   # 遗留（原异步接收线程配置，现已不再使用）
+    ├── common/                  # 公共库（静态库 libcommon.a）
+    │   ├── include/Utilities/
+    │   │   ├── SharedMemory.h   # 上下位机共享内存（shm_open + sem_com 锁）
+    │   │   └── sem_com.h        # System V 信号量互斥锁
+    │   └── src/Utilities/       # 对应实现
     ├── drives/                  # 串口驱动库（静态库 libdrives.a）
     │   ├── include/
     │   │   ├── serial_port.hpp  # SerialPort：硬件层（termios 串口）
@@ -135,6 +210,7 @@ delta_arm/
     │   ├── yaml-cpp/            # 配置解析
     │   └── common/              # PeriodicTask 等（遗留，现不直接使用）
     └── tools/
+        ├── upper_sim.py         # Python 上位机模拟脚本（写 xyz，演示每秒一圈）
         ├── testpy.py            # Python 调试脚本（读版本/位置/转速等）
         ├── 正点原子步进电机驱动器modbus-rtu控制协议V1.2(2).xlsx
         └── PDxxS1步进电机闭环驱动器用户手册_V1.0.pdf
@@ -144,6 +220,8 @@ delta_arm/
 
 - Modbus RTU 主站（同步事务：组帧 → CRC → 发送 → 按长度收应答 → 校验）
 - 200 Hz 控制循环，逐台向在线电机下发**闭环绝对位置**命令
+- 上下位机共享内存通信（POSIX `shm_open` + `mmap` + System V 信号量 `sem_com` 互斥）
+- 当前阶段 xyz 直接作为三个电机目标角度（`x`→id1、`y`→id2、`z`→id3，单位：度）
 - 启动时自动探测在线的电机，只控制探测到的从站
 - 支持读实时位置 / 转速 / 状态等遥测
 
