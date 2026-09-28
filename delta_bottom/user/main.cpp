@@ -9,19 +9,8 @@
 #include <cerrno>
 
 #include "modbus_master.hpp"
+#include "MotorMapping.hpp"
 #include "Utilities/SharedMemory.h"
-#include "yaml-cpp/yaml.h"
-
-// ---------------------------------------------------------------------------
-// 正点原子 PDxxS1 命令码：驱动把「寄存器起始地址」当作命令码用（高字节补 0），
-// 读写都走标准 Modbus 帧（读=0x03/0x04，写=0x06/0x10）。
-// ---------------------------------------------------------------------------
-namespace Cmd {
-    constexpr uint16_t READ_POS   = 0x002A;  // 读实时位置（int32，51200=一圈），也用于在线探测
-    constexpr uint16_t READ_SPEED = 0x0029;  // 读实时转速（int16，单位 RPM）
-    constexpr uint16_t ABS_POS    = 0x00F2;  // 闭环绝对位置模式：方向(1)+加减速(1)+速度(2)+位置(4)
-    constexpr uint16_t ENABLE     = 0x00FA;  // 使能：0=使能 / 1=失能
-}
 
 // 运动参数（来自上位机实测）：加减速 200，速度 1000 RPM
 constexpr uint8_t  MOVE_ACCEL = 200;
@@ -30,43 +19,9 @@ constexpr uint16_t MOVE_SPEED = 1000;
 // 角度（度）→ 电机计数：51200 = 一圈 360°
 constexpr double DEG2CNT = 51200.0 / 360.0;
 
-static std::vector<uint8_t> g_cfg_addr = {1, 2, 3};  // 配置里的所有从站地址
-static std::vector<uint8_t> g_addr;                  // 实际在线、要控制的从站地址
-static std::vector<uint64_t> g_err;                  // 每台累计失败次数
 static std::atomic<bool> g_running{true};
 
 static void onSigInt(int) { g_running = false; }
-
-// 从 yaml 读电机地址
-static void loadMotorAddrs(const std::string& path)
-{
-    try {
-        YAML::Node root = YAML::LoadFile(path);
-        std::vector<uint8_t> a;
-        for (const auto& m : root["motors"])
-            a.push_back((uint8_t)m["addr"].as<int>());
-        if (!a.empty()) g_cfg_addr = a;
-    } catch (const std::exception& e) {
-        std::cerr << "读取电机地址失败(" << e.what() << ")，使用默认 {1,2,3}\n";
-    }
-}
-
-// 探测在线电机：逐个读实时位置（0x2A），能应答的才纳入控制列表
-static void detectMotors(ModbusMaster& master)
-{
-    g_addr.clear();
-    for (uint8_t a : g_cfg_addr) {
-        uint16_t buf[2] = {0, 0};
-        if (master.readInputRegisters(a, Cmd::READ_POS, 2, buf))
-            g_addr.push_back(a);
-    }
-    if (g_addr.empty()) {
-        std::cerr << "未探测到任何在线电机，退回配置地址\n";
-        g_addr = g_cfg_addr;
-    }
-    g_err.assign(g_addr.size(), 0);
-    std::cout << "探测到 " << g_addr.size() << " 台在线电机\n";
-}
 
 // 绝对时间睡眠到 next（CLOCK_MONOTONIC + TIMER_ABSTIME，避免周期漂移）
 static void sleepUntil(const std::chrono::steady_clock::time_point& next)
@@ -87,15 +42,18 @@ int main(int argc, char** argv)
     master.resp_timeout_ms = 20;
 
     const std::string cfg = (argc > 1) ? argv[1] : "configs/hardware_config.yaml";
-    loadMotorAddrs(cfg);
-    detectMotors(master);
+    MotorMapping::loadMotorAddrs(cfg);
+    MotorMapping::detectMotors(master);
+
+    // 探测结果以引用取出，后续控制循环沿用 g_addr / g_err 变量名
+    const auto& g_addr = MotorMapping::addrs();
+    auto& g_err = MotorMapping::errs();
 
     ArmSharedMemory shm;                  // 共享内存（命令/状态 + 信号量互斥）
     shm.connect();                        // 连接：首次创建，其余附加
 
-    // 启动时使能所有在线电机（0=使能）
-    for (uint8_t a : g_addr)
-        master.writeRegister(a, Cmd::ENABLE, 0x0000);
+    // 启动时使能所有在线电机
+    MotorMapping::enableMotors(master);
 
     const double freq = 200.0;            // 控制频率 200Hz
     const auto period = std::chrono::nanoseconds((long long)(1e9 / freq));
@@ -119,13 +77,9 @@ int main(int argc, char** argv)
 
         if (cmd.mode == 1) {
             for (size_t i = 0; i < g_addr.size() && i < 3; ++i) {
-                uint16_t regs[4];
-                regs[0] = (uint16_t)((0x00 << 8) | MOVE_ACCEL);  // 方向 0=正转 | 加减速
-                regs[1] = MOVE_SPEED;                            // 速度 RPM
-                regs[2] = (uint16_t)(counts[i] >> 16);
-                regs[3] = (uint16_t)(counts[i] & 0xFFFF);
-
-                if (!master.writeRegisters(g_addr[i], Cmd::ABS_POS, 4, regs))
+                // 下发绝对位置：方向 0=正转，加减速 MOVE_ACCEL，速度 MOVE_SPEED
+                if (!MotorMapping::moveAbsolute(master, g_addr[i], counts[i],
+                                                0, MOVE_ACCEL, MOVE_SPEED))
                     ++g_err[i];
             }
         }

@@ -46,10 +46,16 @@ target_link_libraries(common PUBLIC
 add_subdirectory(drives)
 
 # ---------------------------------------------------------------------------
+# Kinematics: 电机映射 / 扫描（MotorMapping）
+# ---------------------------------------------------------------------------
+add_subdirectory(Kinematics)
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 add_executable(delta_bottom user/main.cpp)
 target_link_libraries(delta_bottom PRIVATE
   common
   drives
+  kinematics
 )

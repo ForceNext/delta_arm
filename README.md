@@ -89,10 +89,10 @@ while (running) {
 | 模块 | 目录 | 状态 | 职责 |
 | --- | --- | --- | --- |
 | `SerialPort` / `ModbusMaster` | `drives/` | ✅ 已有 | 电机通信（组帧/CRC/收发/校验） |
-| `SharedMemory` | `comm/` | 🚧 待实现 | `shm_open` + `mmap` + seqlock，读命令 / 写状态 |
-| `Kinematics` | `kinematics/` | 🚧 待实现 | delta 逆解 IK / 正解 FK |
-| `MotorMapping` | `kinematics/` | 🚧 待实现 | 关节角 ↔ 电机计数（减速比、零点、方向） |
-| `ControlLoop` | `control/` | 🚧 待实现 | 200 Hz 主循环，串联上述模块 |
+| `SharedMemory` | `common/` | ✅ 已有 | `shm_open` + `mmap` + 信号量互斥，读命令 / 写状态 |
+| `MotorMapping` | `Kinematics/` | ✅ 已有 | 电机扫描/使能/运动控制 + 关节角 ↔ 电机计数换算 |
+| `Kinematics`（IK/FK） | `Kinematics/` | 🚧 待实现 | delta 逆解 IK / 正解 FK |
+| `ControlLoop` | `user/` | ✅ 已有 | 200 Hz 主循环（main.cpp），串联上述模块 |
 
 ### 时序预算（200 Hz = 5 ms）
 
@@ -204,6 +204,12 @@ delta_arm/
     │   └── src/
     │       ├── serial_port.cpp
     │       └── modbus_master.cpp
+    ├── Kinematics/               # 电机映射库（静态库 libkinematics.a）
+    │   ├── CMakeLists.txt
+    │   ├── include/
+    │   │   └── MotorMapping.hpp # 电机扫描/使能/运动控制 + 角度↔计数换算
+    │   └── src/
+    │       └── MotorMapping.cpp
     ├── user/
     │   └── main.cpp             # 应用层：200 Hz 控制循环
     ├── third_party/
@@ -220,6 +226,7 @@ delta_arm/
 
 - Modbus RTU 主站（同步事务：组帧 → CRC → 发送 → 按长度收应答 → 校验）
 - 200 Hz 控制循环，逐台向在线电机下发**闭环绝对位置**命令
+- 电机映射与控制封装（`Kinematics/MotorMapping`）：使能/失能、工作模式、绝对/相对位置、刹车、清除状态、角度↔计数换算
 - 上下位机共享内存通信（POSIX `shm_open` + `mmap` + System V 信号量 `sem_com` 互斥）
 - 当前阶段 xyz 直接作为三个电机目标角度（`x`→id1、`y`→id2、`z`→id3，单位：度）
 - 启动时自动探测在线的电机，只控制探测到的从站
@@ -270,21 +277,30 @@ serial:
 
 motors:                    # 电机（从站）列表
   - addr: 1                # 从站地址（0=广播，1~255 从站）
-    name: "joint_base"
-    speed_rpm: 500
-    accel: 50
-    limit_min: -512000
-    limit_max: 512000
-  # ... 其余关节同理
+    name: "motor_1"
+    speed_rpm: 1000
+    accel: 200
+  - addr: 2
+    name: "motor_2"
+    speed_rpm: 1000
+    accel: 200
+  - addr: 3
+    name: "motor_3"
+    speed_rpm: 1000
+    accel: 200
 ```
 
 - `serial.port` / `serial.baudrate`：串口与波特率。
 - `motors[].addr`：驱动器从站地址；程序启动时逐个探测，**只控制在线者**，未连接的地址不会拖慢循环。
+- 目前 `loadMotorAddrs()` 只读取 `motors[].addr`，`name` / `speed_rpm` / `accel` 为预留字段，暂未在控制循环中使用。
 
 ## 架构与数据流
 
 ```
-main.cpp（应用层：200 Hz 控制循环 + 命令码封装）
+main.cpp（应用层：200 Hz 控制循环，读共享内存 xyz → 换算 → 下发）
+   │ MotorMapping::moveAbsolute() 等（电机映射 / 控制封装）
+   ▼
+MotorMapping（Kinematics/：角度↔计数换算 + 扫描/使能/运动控制，组命令码）
    │ writeRegisters() / readInputRegisters()
    ▼
 ModbusMaster（通信层：组帧 + CRC + 发送 + 两段超时收应答 + 校验）
@@ -295,6 +311,7 @@ SerialPort（硬件层：termios 串口，8N1 原始模式，半双工 tcdrain�
 
 - **SerialPort**：封装 Linux 串口；`write()` 末尾 `tcdrain` 保证半双工发完再等应答；`readExact()` 按期望长度精确收帧，避免帧尾静默等待拖慢循环。
 - **ModbusMaster**：同步事务，一次调用 = 一次「发 + 收 + 校验」。提供读（0x03/0x04）、写单（0x06）、写多（0x10）。
+- **MotorMapping**：电机映射与控制封装（静态方法），把角度换算成计数、把业务动作映射成命令码（使能/绝对位置/刹车等），内部调用 ModbusMaster。
 - **main**：200 Hz 循环，用绝对时间（`clock_nanosleep(TIMER_ABSTIME)`）调度避免周期漂移；逐台下发闭环绝对位置，失败跳过并计数。
 
 ## 通信协议
@@ -307,8 +324,11 @@ SerialPort（硬件层：termios 串口，8N1 原始模式，半双工 tcdrain�
 | `0x29` | 读实时转速（int16，单位 RPM） |
 | `0x2A` | 读实时位置（int32，`51200` = 一圈） |
 | `0x2C` | 读运行状态 |
+| `0x62` | 设置工作模式（0=通信位置 … 7=回零） |
 | `0xF2` | 闭环绝对位置模式控制 |
+| `0xF3` | 闭环相对位置模式控制 |
 | `0xFA` | 使能控制（0=使能 / 1=失能） |
+| `0xFB` | 清除状态（堵转/刹车/失能） |
 | `0xFC` | 立即停止（刹车） |
 
 闭环绝对位置（`0xF2`）数据区 8 字节 = 4 个寄存器：
@@ -322,17 +342,30 @@ SerialPort（硬件层：termios 串口，8N1 原始模式，半双工 tcdrain�
 
 位置换算：`一圈 360° = 51200`，故 `90° = 12800`、`一圈/s = 51200 计数/s`。
 
-## 运动参数
+## 运动参数与控制封装
 
-`delta_bottom/user/main.cpp` 顶部集中定义：
+`delta_bottom/user/main.cpp` 顶部集中定义运动参数：
 
 ```cpp
-constexpr uint8_t  MOVE_ACCEL = 200;   // 加减速
-constexpr uint16_t MOVE_SPEED = 1000;  // 速度上限 RPM
-constexpr double   REV = 51200.0;      // 一圈对应的计数
+constexpr uint8_t  MOVE_ACCEL = 200;            // 加减速（0~200）
+constexpr uint16_t MOVE_SPEED = 1000;           // 速度上限 RPM
+constexpr double   DEG2CNT = 51200.0 / 360.0;   // 角度（度）→ 电机计数
 ```
 
-当前演示轨迹为「一圈/s 匀速旋转」，位置按真实时间 `pos = REV * t` 计算；接正逆解 / 轨迹规划时替换这段即可。
+`Kinematics/MotorMapping` 封装了角度 ↔ 计数换算与运动控制（均为静态方法，`motorId` 直接对应从站地址 1~3）：
+
+| 方法 | 功能 | 命令码 |
+| --- | --- | --- |
+| `loadMotorAddrs()` / `detectMotors()` | 读配置地址 / 探测在线电机 | `0x2A` |
+| `setMotorEnable()` / `enableMotors()` | 单台 / 全部使能（失能） | `0x00FA` |
+| `SetMotorMode()` | 设置工作模式 | `0x62` |
+| `moveAbsolute()` / `moveRelative()` | 绝对 / 相对位置控制 | `0xF2` / `0xF3` |
+| `stopMotor()` / `clearStatus()` | 立即停止（刹车）/ 清除状态 | `0xFC` / `0xFB` |
+| `angleToMotorPos()` / `motorPosToAngle()` | 关节角（度）↔ 电机计数换算 | — |
+
+> 注意：`stopMotor()` 刹停后需及时调用 `clearStatus()` 清除状态，否则电机可能严重发烫（见手册 5.4.13）。
+
+当前演示：上层经共享内存下发 xyz（直接作为三电机目标角度，单位度），底层换算成计数后下发绝对位置；接正逆解 / 轨迹规划时替换这段即可。
 
 ## 调试
 
