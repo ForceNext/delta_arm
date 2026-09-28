@@ -165,7 +165,8 @@ ssize_t SerialPort::write(const uint8_t* data, size_t len)
         ssize_t n = ::write(fd_, data + total, len - total);
         if (n < 0) {
             if (errno == EINTR) continue;         // 被信号打断，重试
-            if (errno == EAGAIN) {                // 缓冲满，等可写
+            if (errno == EAGAIN) 
+            {                // 缓冲满，等可写
                 fd_set wfds;
                 FD_ZERO(&wfds);
                 FD_SET(fd_, &wfds);
