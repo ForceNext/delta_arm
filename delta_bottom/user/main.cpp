@@ -64,7 +64,8 @@ int main(int argc, char** argv)
     auto next  = start;
     uint64_t cycle = 0;
 
-    while (g_running) {
+    while (g_running) 
+    {
         // 1) 读上位机命令：xyz 直接作为三个电机的目标角度（mode=1 时生效）
         ArmCommand cmd;
         shm.readCommand(cmd);

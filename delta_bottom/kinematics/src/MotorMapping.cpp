@@ -2,9 +2,6 @@
 // 各命令码（寄存器起始地址）定义见 MotorMapping.hpp 的 Cmd 命名空间。
 #include "MotorMapping.hpp"
 
-#include <iostream>
-
-#include "yaml-cpp/yaml.h"
 
 // 设置工作模式（功能码 0x06，寄存器 0x62）：
 //   0=通信位置  1=通信速度  2=通信力矩  3=脉冲

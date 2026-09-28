@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <iostream>
 
+#include "yaml-cpp/yaml.h"
 #include "modbus_master.hpp"
 
 #define MOTOR_RESOLUTION 51200.0  //电机单圈分辨率

@@ -46,9 +46,14 @@ target_link_libraries(common PUBLIC
 add_subdirectory(drives)
 
 # ---------------------------------------------------------------------------
-# Kinematics: 电机映射 / 扫描（MotorMapping）
+# kinematics: 电机映射 / 扫描（MotorMapping）+ 正逆解（Kinematics）
 # ---------------------------------------------------------------------------
-add_subdirectory(Kinematics)
+add_subdirectory(kinematics)
+
+# ---------------------------------------------------------------------------
+# task: 机械臂驱动任务（arm_drive_task）
+# ---------------------------------------------------------------------------
+add_subdirectory(task)
 
 # ---------------------------------------------------------------------------
 # Application
@@ -58,4 +63,5 @@ target_link_libraries(delta_bottom PRIVATE
   common
   drives
   kinematics
+  task
 )
