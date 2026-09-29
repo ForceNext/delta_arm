@@ -26,7 +26,11 @@ PeriodicTask::PeriodicTask(PeriodicTaskManager* taskManager, float period,
     : _period(period), _name(name) {
   taskManager->addTask(this);
 }
-
+void *func(void* p)
+{
+    PeriodicTask* task = (PeriodicTask*)p;
+    return task;
+}
 /*!
  * Begin running task
  */
@@ -38,7 +42,17 @@ void PeriodicTask::start() {
   }
   init();
   _running = true;
-  _thread = std::thread(&PeriodicTask::loopFunction, this);
+  pthread_t ntid_nomal = 0;
+  int ret = 0;
+  ret = pthread_attr_init(&_attr);
+
+  ret = pthread_attr_setinheritsched(&_attr, PTHREAD_EXPLICIT_SCHED);
+
+  ret = pthread_attr_setschedpolicy(&_attr, SCHED_FIFO);
+
+  ret = pthread_attr_setschedparam(&_attr, &schedule_param);
+
+  ret = pthread_create(&ntid_nomal,&_attr,&func,this);
 }
 
 /*!

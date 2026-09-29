@@ -5,6 +5,8 @@
 #include "Utilities/SharedMemory.h"
 #include "MotorMapping.hpp"
 #include "yaml-cpp/yaml.h"
+#include "Utilities/Timer.h"
+#include "Utilities/Utilities_print.h"
 
 class ArmDriveTask : public PeriodicTask
 {
@@ -14,9 +16,12 @@ public:
     void init() override;
     void run() override;
     void cleanup() override;
-
+    void print_loop_rate();
 private:
-
+    Timer time_ctrl;
+    uint16_t loop_counter_;
+    double time_start_sec_;
+    float dt;
 };
 
 #endif

@@ -61,6 +61,9 @@ class PeriodicTask {
   float _maxRuntime = 0;
   std::string _name;
   std::thread _thread;
+
+  pthread_attr_t _attr;
+  struct sched_param schedule_param;
 };
 
 /*!
