@@ -55,29 +55,21 @@ class PeriodicTask {
  private:
   static void* func(void* p);
 
-  float period;
-  volatile bool running = false;
-  std::string name;
-  int good_bind=0;
-  int cpu_id_set=0;
-  int cpu_num = 0;
-  cpu_set_t mask;
-  float lastRuntime = 0;
-  double realRunTime = 0;
-  float lastPeriodTime = 0;
-  float maxPeriod = 0;
-  float maxRuntime = 0;
-
   float _period;
   volatile bool _running = false;
   float _lastRuntime = 0;
   float _lastPeriodTime = 0;
   float _maxPeriod = 0;
   float _maxRuntime = 0;
+  double _realRunTime = 0;
   std::string _name;
-  std::thread _thread;
+  pthread_t _thread_id = 0;
   pthread_attr_t _attr;
-  struct sched_param schedule_param;
+  struct sched_param _schedule_param;
+
+  int _cpu_num = 0;
+  int _cpu_id_set = 0;
+  cpu_set_t _mask;
 };
 
 /*!

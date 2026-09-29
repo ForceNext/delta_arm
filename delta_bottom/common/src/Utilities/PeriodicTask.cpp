@@ -24,7 +24,7 @@
  */
 PeriodicTask::PeriodicTask(PeriodicTaskManager* taskManager, float period,
                            std::string name)
-    : period(period), name(name) {
+    : _period(period), _name(name) {
   taskManager->addTask(this);
 }
 
@@ -32,51 +32,51 @@ PeriodicTask::PeriodicTask(PeriodicTaskManager* taskManager, float period,
 void* PeriodicTask::func(void* p)
 {
     PeriodicTask* task = (PeriodicTask*)p;
-    task->cpu_num = sysconf(_SC_NPROCESSORS_ONLN);
+    task->_cpu_num = sysconf(_SC_NPROCESSORS_ONLN);
     printf_color(PrintColor::Blue,
                  "[CPU] System has %d processors \n",
-                 task->cpu_num);
+                 task->_cpu_num);
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_ZERO(&task->mask);
-    if(task->cpu_id_set >= 0 && task->cpu_id_set < task->cpu_num)
+    CPU_ZERO(&task->_mask);
+    if(task->_cpu_id_set >= 0 && task->_cpu_id_set < task->_cpu_num)
     {
-        CPU_SET(task->cpu_id_set, &task->mask);
-        if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &task->mask)!=0)
+        CPU_SET(task->_cpu_id_set, &task->_mask);
+        if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &task->_mask)!=0)
         {
           printf_color(PrintColor::Red,
                         "[CPU] Set thread affinity to CPU %d failed \n",
-                        task->cpu_id_set);
+                        task->_cpu_id_set);
         }
         else
         {
+          cpu_set_t cpuset;
           CPU_ZERO(&cpuset);
-          if(pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)!=0)
+          if(pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)!=0 ||
+             !CPU_ISSET(task->_cpu_id_set, &cpuset))
           {
             printf_color(PrintColor::Red,
-                         "[CPU] Get thread affinity to CPU %d failed \n",
-                         task->cpu_id_set);
+                         "[CPU] Verify thread affinity to CPU %d failed \n",
+                         task->_cpu_id_set);
           }
           else
           {
             printf_color(PrintColor::Green,
                          "[CPU] Set thread affinity to CPU %d success \n",
-                         task->cpu_id_set);
+                         task->_cpu_id_set);
           }
-        };
+        }
     }
     else
     {
         printf_color(PrintColor::Red,
                      "[CPU] Invalid CPU ID %d, not setting affinity \n",
-                     task->cpu_id_set);
+                     task->_cpu_id_set);
     }
 
     Timer tim;
-    
-    int seconds = (int)task->period;
-    int nanoseconds = (int)(1e9 * std::fmod(task->period, 1.f));
+
+    int seconds = (int)task->_period;
+    int nanoseconds = (int)(1e9 * std::fmod(task->_period, 1.f));
     unsigned long long missed = 0;
     auto timerFd = timerfd_create(CLOCK_MONOTONIC, 0);
     itimerspec timerSpec;
@@ -86,24 +86,23 @@ void* PeriodicTask::func(void* p)
     timerSpec.it_interval.tv_nsec = nanoseconds;
     timerfd_settime(timerFd, 0, &timerSpec, nullptr);
 
-    while (task->_running) 
+    while (task->_running)
     {
-        task->lastPeriodTime = (float)tim.getSeconds();
+        task->_lastPeriodTime = (float)tim.getSeconds();
         tim.start();
-        if(task->running == false)break;
 
         task->run();//主任务函数
 
-        task->lastRuntime = (float)tim.getSeconds();
-        task->realRunTime = tim.getRealTime();
+        task->_lastRuntime = (float)tim.getSeconds();
+        task->_realRunTime = tim.getRealTime();
 
         int m = read(timerFd, &missed, sizeof(missed));//阻塞
         (void)m;
-        task->maxPeriod  = std::max(task->maxPeriod, task->lastPeriodTime);
-        task->maxRuntime = std::max(task->maxRuntime, task->lastRuntime);
+        task->_maxPeriod  = std::max(task->_maxPeriod, task->_lastPeriodTime);
+        task->_maxRuntime = std::max(task->_maxRuntime, task->_lastRuntime);
     }
 
-    return task;
+    return nullptr;
 }
 
 
@@ -117,7 +116,6 @@ void PeriodicTask::start() {
     return;
   }
   init();
-  pthread_t ntid_nomal = 0;
   int ret = 0;
 
   ret = pthread_attr_init(&_attr);
@@ -144,7 +142,7 @@ void PeriodicTask::start() {
     return;
   }
 
-  ret = pthread_attr_setschedparam(&_attr, &schedule_param);
+  ret = pthread_attr_setschedparam(&_attr, &_schedule_param);
   if (ret != 0) {
     printf_color(PrintColor::Red,
                  "[PeriodicTask] %s: pthread_attr_setschedparam failed: %s\n",
@@ -152,17 +150,16 @@ void PeriodicTask::start() {
     return;
   }
 
-  ret = pthread_create(&ntid_nomal, &_attr, &func, this);
+  _running = true;
+
+  ret = pthread_create(&_thread_id, &_attr, &func, this);
   if (ret != 0) {
+    _running = false;
     printf_color(PrintColor::Red,
                  "[PeriodicTask] %s: pthread_create failed: %s\n",
                  _name.c_str(), strerror(ret));
     return;
   }
-
-  _running = true;
-
-  pthread_join(ntid_nomal, NULL);
 }
 
 /*!
@@ -176,7 +173,8 @@ void PeriodicTask::stop() {
   }
   _running = false;
   printf("[PeriodicTask] Waiting for %s to stop...\n", _name.c_str());
-  _thread.join();
+  pthread_join(_thread_id, NULL);
+  pthread_attr_destroy(&_attr);
   printf("[PeriodicTask] Done!\n");
   cleanup();
 }
