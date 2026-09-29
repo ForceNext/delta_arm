@@ -135,8 +135,7 @@ static void onSignal(int) { g_running = 0; }
 
 int main(int argc, char** argv)
 {
-    std::cout << "Hello, Delta Arm!" << std::endl;
-
+    printf_color(PrintColor::Green,"Hello, Delta Arm!\n");
     PeriodicTaskManager *taskManager = PeriodicTaskManager::get_instance();
     // 读取线程配置（默认值：周期 5ms、绑定 CPU4、优先级 75）
     float thread_t = 0.005f;
