@@ -8,8 +8,9 @@
 #define PROJECT_PERIODICTASK_H
 
 #include <string>
-#include <thread>
 #include <vector>
+#include <pthread.h>
+#include <sched.h>
 
 class PeriodicTaskManager;
 
