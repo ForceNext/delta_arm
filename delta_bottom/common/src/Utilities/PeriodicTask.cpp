@@ -9,6 +9,7 @@
 
 #include <unistd.h>
 #include <cmath>
+#include <cstring>
 
 #include "Utilities/PeriodicTask.h"
 #include "Utilities/Timer.h"
@@ -23,14 +24,89 @@
  */
 PeriodicTask::PeriodicTask(PeriodicTaskManager* taskManager, float period,
                            std::string name)
-    : _period(period), _name(name) {
+    : period(period), name(name) {
   taskManager->addTask(this);
 }
-void *func(void* p)
+
+
+void* PeriodicTask::func(void* p)
 {
     PeriodicTask* task = (PeriodicTask*)p;
+    task->cpu_num = sysconf(_SC_NPROCESSORS_ONLN);
+    printf_color(PrintColor::Blue,
+                 "[CPU] System has %d processors \n",
+                 task->cpu_num);
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_ZERO(&task->mask);
+    if(task->cpu_id_set >= 0 && task->cpu_id_set < task->cpu_num)
+    {
+        CPU_SET(task->cpu_id_set, &task->mask);
+        if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &task->mask)!=0)
+        {
+          printf_color(PrintColor::Red,
+                        "[CPU] Set thread affinity to CPU %d failed \n",
+                        task->cpu_id_set);
+        }
+        else
+        {
+          CPU_ZERO(&cpuset);
+          if(pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)!=0)
+          {
+            printf_color(PrintColor::Red,
+                         "[CPU] Get thread affinity to CPU %d failed \n",
+                         task->cpu_id_set);
+          }
+          else
+          {
+            printf_color(PrintColor::Green,
+                         "[CPU] Set thread affinity to CPU %d success \n",
+                         task->cpu_id_set);
+          }
+        };
+    }
+    else
+    {
+        printf_color(PrintColor::Red,
+                     "[CPU] Invalid CPU ID %d, not setting affinity \n",
+                     task->cpu_id_set);
+    }
+
+    Timer tim;
+    
+    int seconds = (int)task->period;
+    int nanoseconds = (int)(1e9 * std::fmod(task->period, 1.f));
+    unsigned long long missed = 0;
+    auto timerFd = timerfd_create(CLOCK_MONOTONIC, 0);
+    itimerspec timerSpec;
+    timerSpec.it_interval.tv_sec = seconds;
+    timerSpec.it_value.tv_sec = seconds;
+    timerSpec.it_value.tv_nsec = nanoseconds;
+    timerSpec.it_interval.tv_nsec = nanoseconds;
+    timerfd_settime(timerFd, 0, &timerSpec, nullptr);
+
+    while (task->_running) 
+    {
+        task->lastPeriodTime = (float)tim.getSeconds();
+        tim.start();
+        if(task->running == false)break;
+
+        task->run();//主任务函数
+
+        task->lastRuntime = (float)tim.getSeconds();
+        task->realRunTime = tim.getRealTime();
+
+        int m = read(timerFd, &missed, sizeof(missed));//阻塞
+        (void)m;
+        task->maxPeriod  = std::max(task->maxPeriod, task->lastPeriodTime);
+        task->maxRuntime = std::max(task->maxRuntime, task->lastRuntime);
+    }
+
     return task;
 }
+
+
 /*!
  * Begin running task
  */
@@ -41,18 +117,52 @@ void PeriodicTask::start() {
     return;
   }
   init();
-  _running = true;
   pthread_t ntid_nomal = 0;
   int ret = 0;
+
   ret = pthread_attr_init(&_attr);
+  if (ret != 0) {
+    printf_color(PrintColor::Red,
+                 "[PeriodicTask] %s: pthread_attr_init failed: %s\n",
+                 _name.c_str(), strerror(ret));
+    return;
+  }
 
   ret = pthread_attr_setinheritsched(&_attr, PTHREAD_EXPLICIT_SCHED);
+  if (ret != 0) {
+    printf_color(PrintColor::Red,
+                 "[PeriodicTask] %s: pthread_attr_setinheritsched failed: %s\n",
+                 _name.c_str(), strerror(ret));
+    return;
+  }
 
   ret = pthread_attr_setschedpolicy(&_attr, SCHED_FIFO);
+  if (ret != 0) {
+    printf_color(PrintColor::Red,
+                 "[PeriodicTask] %s: pthread_attr_setschedpolicy failed: %s\n",
+                 _name.c_str(), strerror(ret));
+    return;
+  }
 
   ret = pthread_attr_setschedparam(&_attr, &schedule_param);
+  if (ret != 0) {
+    printf_color(PrintColor::Red,
+                 "[PeriodicTask] %s: pthread_attr_setschedparam failed: %s\n",
+                 _name.c_str(), strerror(ret));
+    return;
+  }
 
-  ret = pthread_create(&ntid_nomal,&_attr,&func,this);
+  ret = pthread_create(&ntid_nomal, &_attr, &func, this);
+  if (ret != 0) {
+    printf_color(PrintColor::Red,
+                 "[PeriodicTask] %s: pthread_create failed: %s\n",
+                 _name.c_str(), strerror(ret));
+    return;
+  }
+
+  _running = true;
+
+  pthread_join(ntid_nomal, NULL);
 }
 
 /*!
@@ -99,46 +209,6 @@ void PeriodicTask::printStatus() {
     printf("|%-20s|%6.4f|%6.4f|%6.4f|%6.4f|%6.4f\n", _name.c_str(),
            _lastRuntime, _maxRuntime, _period, _lastPeriodTime, _maxPeriod);
   }
-}
-
-/*!
- * Call the task in a timed loop.  Uses a timerfd
- */
-void PeriodicTask::loopFunction() {
-#ifdef linux
-  auto timerFd = timerfd_create(CLOCK_MONOTONIC, 0);
-#endif
-  int seconds = (int)_period;
-  int nanoseconds = (int)(1e9 * std::fmod(_period, 1.f));
-
-  Timer t;
-
-#ifdef linux
-  itimerspec timerSpec;
-  timerSpec.it_interval.tv_sec = seconds;
-  timerSpec.it_value.tv_sec = seconds;
-  timerSpec.it_value.tv_nsec = nanoseconds;
-  timerSpec.it_interval.tv_nsec = nanoseconds;
-
-  timerfd_settime(timerFd, 0, &timerSpec, nullptr);
-#endif
-  unsigned long long missed = 0;
-
-  printf("[PeriodicTask] Start %s (%d s, %d ns)\n", _name.c_str(), seconds,
-         nanoseconds);
-  while (_running) {
-    _lastPeriodTime = (float)t.getSeconds();
-    t.start();
-    run();
-    _lastRuntime = (float)t.getSeconds();
-#ifdef linux
-    int m = read(timerFd, &missed, sizeof(missed));
-    (void)m;
-#endif
-    _maxPeriod = std::max(_maxPeriod, _lastPeriodTime);
-    _maxRuntime = std::max(_maxRuntime, _lastRuntime);
-  }
-  printf("[PeriodicTask] %s has stopped!\n", _name.c_str());
 }
 
 PeriodicTaskManager::~PeriodicTaskManager() {}

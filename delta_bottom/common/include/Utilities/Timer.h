@@ -45,6 +45,14 @@ class Timer {
    */
   double getSeconds() { return (double)getNs() / 1.e9; }
 
+  double getRealTime() {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+
+      return (double)((int64_t)(now.tv_nsec) +
+              1000000000 * (now.tv_sec))/1.e9;
+  }
+
   struct timespec _startTime;
 };
 
