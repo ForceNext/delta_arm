@@ -4,13 +4,14 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 
 ## 当前状态
 
-**已实现（可运行）**：串口通信 → Modbus 组帧/校验 → 电机使能与绝对位置控制 → 200 Hz 控制循环 → 上下位机共享内存通信。
-
-**未实现**：运动学正逆解（delta 逆解 / 正解）。当前阶段把上位机下发的 `x/y/z` **直接当作三个电机的目标角度**（单位：度）下发电机，用于跑通链路与演示。详细见 [后续规划](#后续规划路线图)。
+- **已实现（可运行）**：实时任务框架 `PeriodicTask`（`timerfd` 周期调度 + `SCHED_FIFO` 实时优先级 + CPU 亲和性绑定 + 线程生命周期管理）；串口驱动 `SerialPort`、Modbus 主站 `ModbusMaster`、电机控制封装 `MotorMapping`、上下位机共享内存 `ArmSharedMemory`。
+- **重构过渡中**：主循环已从旧的 `clock_nanosleep` 单线程循环迁移到 `PeriodicTask` 框架。当前 `ArmDriveTask`（`task/`）是**占位实现**——`run()` 只做 200 Hz 循环速率统计打印，**尚未接入串口 / Modbus / 电机控制**。完整的「读共享内存 → 下发电机」链路目前仍在注释掉的旧 `main()`（[user/main.cpp](delta_bottom/user/main.cpp) 顶部）里。
+- **未实现**：运动学正逆解（delta 逆解 / 正解）。当前阶段把上位机下发的 `x/y/z` **直接当作三个电机的目标角度**（单位：度）下发电机，用于跑通链路与演示。
 
 ## 关键设计
 
-- **控制频率**：200 Hz（`clock_nanosleep` 绝对时间调度，避免周期漂移）
+- **控制频率**：200 Hz（默认周期 `0.005 s`，由 `timerfd`（`CLOCK_MONOTONIC`）精确唤醒，避免周期漂移）
+- **实时调度**：`SCHED_FIFO` + 可配置优先级（默认 75），线程绑定到指定 CPU；无 `root` / `CAP_SYS_NICE` 权限时**自动降级为普通调度**继续运行
 - **通信协议**：Modbus RTU（实际使用 `04H` 读输入寄存器 / `06H` 写单寄存器 / `10H` 写多寄存器）
 - **驱动器**：正点原子 PDxxS1 闭环步进驱动器，位置分辨率 `51200` = 一圈（360°）
 - **上下位机通信**：POSIX 共享内存（`shm_open` + `mmap`）+ System V 信号量互斥（key `0x5A11`）
@@ -18,22 +19,26 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 
 ## 架构与数据流
 
+### 目标链路
+
 ```
 上位机(独立进程，不在本工程)          本工程 delta_bottom                    电机 ×3
 ─────────────────────────           ────────────────────────               ───────
-写 ArmCommand{seq, mode, x, y, z}  200Hz 循环：                            PDxxS1
+写 ArmCommand{seq, mode, x, y, z}  ArmDriveTask 200Hz 循环：             PDxxS1
  x/y/z = 电机1/2/3 目标角(度)       ① 读命令（sem_p 加锁）
   ─────── 共享内存 /delta_arm ────▶ ② mode==1 时：角度(度) × DEG2CNT → 计数
                                     ③ moveAbsolute 逐台下发  ──Modbus RTU──▶
   ◀─────── 发布 ArmStatus ────────  ④ 发布状态（回显目标值，非实测）
 ```
 
-分层调用链：
+> **注意**：上图为目标链路。当前 `ArmDriveTask::run()` 只做循环速率统计，①②③④ 尚未接入任务线程，仍保留在注释掉的旧 `main()` 中。
+
+### 分层调用链
 
 ```
-main.cpp（应用层：200 Hz 循环，读共享内存 → 角度换算 → 下发）
-   │ MotorMapping::moveAbsolute() 等
-   ▼
+main.cpp（应用层：读 thread_config → 建 ArmDriveTask → 绑定 CPU/优先级 → start）
+   │ ArmDriveTask::run()（占位：print_loop_rate）
+   ▼（待接入）
 MotorMapping（kinematics/：角度↔计数换算 + 扫描/使能/绝对位置，组命令码）
    │ writeRegisters() / readInputRegisters()
    ▼
@@ -43,46 +48,42 @@ ModbusMaster（drives/：组帧 + CRC-16 + 发送 + 两段超时收应答 + 校�
 SerialPort（drives/：termios 串口，8N1 原始模式，半双工 tcdrain）
 ```
 
-### 控制循环（[user/main.cpp](delta_bottom/user/main.cpp)）
+## 实时任务框架（`PeriodicTask`）
 
-```cpp
-while (running) {
-    // 1. 读上位机命令（共享内存，加锁）
-    ArmCommand cmd;
-    shm.readCommand(cmd);
+`common/Utilities/PeriodicTask` 是本工程的控制线程基础设施：
 
-    // 2. 角度(度) → 电机计数：51200 = 一圈
-    double target[3] = {cmd.x, cmd.y, cmd.z};
-    uint32_t counts[3];
-    for (int i = 0; i < 3; ++i)
-        counts[i] = (uint32_t)llround(target[i] * DEG2CNT);
+- **周期调度**：每个任务线程内部用 `timerfd` 按 `period` 精确唤醒（`func()` 中 `read(timerFd)` 阻塞到下一拍）。
+- **实时优先级**：`start()` 里通过 `pthread_attr_*` 设置 `SCHED_FIFO`；若 `pthread_create` 返回 `EPERM`（无 `root` / `CAP_SYS_NICE`），自动用默认属性重试，降级为普通调度。
+- **CPU 亲和性**：`set_bind_cpu(id)` 把线程绑到指定核（`pthread_setaffinity_np`）。
+- **生命周期**：`start()` 异步启动线程；`stop()` 置 `_running=false` → `pthread_join` 收尾 → 调用 `cleanup()`。
+- **纯虚接口**：子类实现 `init()` / `run()` / `cleanup()`。
 
-    // 3. mode==1 时逐台下发绝对位置（失败累加错误计数）
-    if (cmd.mode == 1)
-        for (size_t i = 0; i < addrs.size() && i < 3; ++i)
-            if (!MotorMapping::moveAbsolute(master, addrs[i], counts[i], 0, MOVE_ACCEL, MOVE_SPEED))
-                ++err[i];
+关键 API：
 
-    // 4. 发布状态（当前回显目标值，未回读电机实际位置）
-    shm.writeStatus(status);
+| 成员 | 说明 |
+| --- | --- |
+| `PeriodicTask(manager, period, name)` | 构造并注册到 `PeriodicTaskManager` |
+| `start()` / `stop()` | 启动 / 停止线程 |
+| `set_bind_cpu(int id)` | 绑定 CPU |
+| `set_sched_priority(int p)` | 设置 `SCHED_FIFO` 优先级 |
+| `init()` / `run()` / `cleanup()` | 纯虚，子类实现 |
+| `PeriodicTaskManager::get_instance()` | 单例任务管理器 |
+| `addTask()` / `stopAll()` / `printStatus()` | 管理任务 / 全停 / 打印各任务周期统计 |
 
-    // 5. 睡到下一个 200 Hz 绝对周期边界
-}
-```
-
-> **注意**：当前循环只**下发**指令并回显目标值，**没有回读电机实际位置/转速**。电机实际状态回读 + 正解发布属于后续规划（见 [路线图](#后续规划路线图)）。
+另提供模板 `PeriodicFunction`（包装自由函数）、`PeriodicMemberFunction<T>`（包装成员函数）与 `PrintTaskStatus`（周期打印任务状态）。
 
 ## 模块划分
 
 | 模块 | 目录 | 职责 | 状态 |
 | --- | --- | --- | --- |
+| `PeriodicTask` / `PeriodicTaskManager` | `common/` | 实时任务框架：周期调度 + 实时优先级 + CPU 亲和性 + 线程生命周期 | ✅ 已实现 |
 | `SerialPort` | `drives/` | 硬件层：termios 串口 8N1、`tcdrain` 半双工、`readExact` 按帧长精确收帧 | ✅ 已实现 |
 | `ModbusMaster` | `drives/` | 协议层：组帧 + CRC + 同步事务（发→收→校验） | ✅ 已实现 |
 | `MotorMapping` | `kinematics/` | 电机扫描/使能/运动控制 + 角度↔计数换算 | ✅ 已实现 |
 | `Kinematics`（IK/FK） | `kinematics/` | delta 逆解 / 正解 | 🚧 空占位 |
-| `arm_drive_task` | `task/` | 机械臂驱动任务 | 🚧 空占位 |
+| `arm_drive_task` | `task/` | 机械臂驱动任务（`PeriodicTask` 子类） | 🚧 占位（仅测速打印） |
 | `SharedMemory` / `sem_com` | `common/` | 上下位机共享内存 + System V 信号量互斥 | ✅ 已实现 |
-| 控制循环 | `user/main.cpp` | 200 Hz 主循环，串联上述模块 | ✅ 已实现 |
+| 应用入口 | `user/main.cpp` | 读线程配置 → 建任务 → 保活 → 优雅退出 | ✅ 已实现 |
 
 ## 项目结构
 
@@ -93,14 +94,14 @@ delta_arm/
     ├── build.sh                      # 一键编译脚本
     ├── CMakeLists.txt                # 顶层构建
     ├── configs/
-    │   ├── hardware_config.yaml      # 串口 + 电机列表
-    │   └── thread_config.yaml        # 遗留（原异步接收线程配置，现已不使用）
+    │   ├── hardware_config.yaml      # 串口 + 电机列表（SerialPort/MotorMapping 使用）
+    │   └── thread_config.yaml        # 线程配置：周期 / 绑定 CPU / 实时优先级
     ├── common/                       # 公共库 libcommon.a
     │   ├── include/
     │   │   ├── Utilities/SharedMemory.h   # 共享内存（shm_open + sem_com 锁）
+    │   │   ├── Utilities/PeriodicTask.h   # 实时任务框架
     │   │   ├── Utilities/sem_com.h        # System V 信号量互斥锁
-    │   │   ├── Utilities/*.h              # Timer/PeriodicTask/utilities 等
-    │   │   └── cTypes.h / Types.h / cppTypes.h  # 遗留类型定义（源自 Cheetah 框架）
+    │   │   └── Utilities/*.h              # Timer/utilities/Utilities_print 等
     │   └── src/Utilities/
     ├── drives/                       # 串口驱动库 libdrives.a
     │   ├── include/{serial_port, modbus_crc, modbus_master}.hpp
@@ -111,7 +112,7 @@ delta_arm/
     ├── task/                         # 机械臂驱动任务库 libtask.a（占位）
     │   ├── include/arm_drive_task.hpp
     │   └── src/arm_drive_task.cpp
-    ├── user/main.cpp                 # 应用层：200 Hz 控制循环
+    ├── user/main.cpp                 # 应用入口：读线程配置 → 建任务 → 保活退出
     ├── third_party/yaml-cpp/         # 配置解析（vendored）
     └── tools/
         ├── upper_sim.py              # Python 上位机模拟脚本（写角度，演示每秒一圈）
@@ -150,14 +151,6 @@ delta_arm/
 
 ## 运动参数与控制封装
 
-`delta_bottom/user/main.cpp` 顶部集中定义运动参数：
-
-```cpp
-constexpr uint8_t  MOVE_ACCEL = 200;            // 加减速（0~200）
-constexpr uint16_t MOVE_SPEED = 1000;           // 速度上限 RPM
-constexpr double   DEG2CNT = 51200.0 / 360.0;   // 角度（度）→ 电机计数
-```
-
 `kinematics/MotorMapping` 封装了角度 ↔ 计数换算与运动控制（均为静态方法，`motorId` 直接对应从站地址 1~3）：
 
 | 方法 | 功能 | 命令码 |
@@ -169,7 +162,7 @@ constexpr double   DEG2CNT = 51200.0 / 360.0;   // 角度（度）→ 电机计�
 | `stopMotor()` / `clearStatus()` | 立即停止（刹车）/ 清除状态 | `0xFC` / `0xFB` |
 | `angleToMotorPos()` / `motorPosToAngle()` | 关节角（度）↔ 电机计数换算 | — |
 
-> 当前 200 Hz 循环只调用了 `detectMotors` / `enableMotors` / `moveAbsolute`；`SetMotorMode` / `moveRelative` / `stopMotor` / `clearStatus` 已封装但暂未在循环中调用。
+> 运动参数（加减速、速度）通过 `moveAbsolute()` / `moveRelative()` 的默认参数传入（`accel=200`、`speed=1000 RPM`）。
 >
 > **注意**：`stopMotor()` 刹停后需及时调用 `clearStatus()` 清除状态，否则电机可能严重发烫（见手册 5.4.13）。
 
@@ -255,17 +248,33 @@ cd delta_bottom
 
 ```bash
 cd delta_bottom
-./build/delta_bottom                     # 使用 configs/hardware_config.yaml
-./build/delta_bottom 路径/到/配置.yaml    # 指定配置文件
+./build/delta_bottom                      # 使用 configs/thread_config.yaml
+./build/delta_bottom 路径/到/线程配置.yaml   # 指定线程配置文件
 ```
 
-Ctrl-C 退出（不刹车，电机停在当前位置）。
+Ctrl-C（或 `SIGTERM`）触发优雅退出：停止任务线程并执行 `cleanup()`。
 
-> 串口设备（如 `/dev/ttyACM0`）默认属于 `dialout` 组，运行前确保当前用户在组内。
+> **实时调度需要权限**：`SCHED_FIFO` 优先级调度需要 `root` 或 `CAP_SYS_NICE`。
+> - `sudo ./build/delta_bottom`，或
+> - `sudo setcap cap_sys_nice+ep ./build/delta_bottom`（授权一次，之后普通用户即可）
+>
+> 无权限时程序会**自动降级为普通调度**继续运行（黄色告警），周期精度靠 `timerfd` 仍能保持，只是没有实时保证。
+>
+> 另外构造函数会写 `/dev/cpu_dma_latency`（关闭 CPU 深度休眠、降低延迟），该项同样需要 `root`；失败仅打印 error，不影响运行。
 
 ## 配置
 
-`delta_bottom/configs/hardware_config.yaml`：
+`delta_bottom/configs/thread_config.yaml`（任务线程配置，当前由 `main.cpp` 读取）：
+
+```yaml
+interface_task:
+  task_thread:
+    thread_t: 0.005        # 周期（秒），0.005 = 200 Hz
+    bind_cpu: 4            # 绑定到的 CPU 核
+    thread_priority: 75    # SCHED_FIFO 实时优先级
+```
+
+`delta_bottom/configs/hardware_config.yaml`（串口 + 电机列表，由 `SerialPort` / `MotorMapping` 读取）：
 
 ```yaml
 serial:
@@ -293,23 +302,24 @@ motors:                    # 电机（从站）列表
 
 ## 硬件与依赖
 
-- Linux（使用 `termios`、`select`、`clock_nanosleep`）
+- Linux（使用 `termios`、`select`、`timerfd`、`pthread` 实时调度）
 - C++17
 - CMake ≥ 3.16
 - [yaml-cpp](https://github.com/jbeder/yaml-cpp)（vendored 于 `third_party/yaml-cpp`）
-- [Eigen3](https://eigen.tuxfamily.org/)（`common/include/cppTypes.h` 等遗留类型定义依赖，当前 200 Hz 循环未直接使用）
+- [Eigen3](https://eigen.tuxfamily.org/)（`common/include/cppTypes.h` 等遗留类型定义依赖，当前控制循环未直接使用）
 
 ## 调试
 
 - `tools/testpy.py`：Python 脚本，逐个读版本 / 位置 / 转速 / 状态，用于验证接线与通信（无需编译 C++）。
-- 运行时程序每 1 s 打印一次「实际频率」与各电机的「错误计数」，用于确认循环是否稳定在 200 Hz、通信是否有丢帧。
+- 运行时 `ArmDriveTask` 每 1000 次循环打印一次实际耗时与频率（约每 5 s 一行），用于确认循环稳定在 200 Hz。
+- `PeriodicTaskManager::printStatus()` / `printStatusOfSlowTasks()` 可打印各任务的最短/最长运行时长与周期，用于定位超时任务。
 
 ## 后续规划（路线图）
 
 以下为**尚未实现**的部分，供后续开发参考：
 
-1. **运动学正逆解**（[kinematics/src/Kinematics.cpp](delta_bottom/kinematics/src/Kinematics.cpp) 目前为空）：实现 delta 逆解 IK（末端 xyz → 三个关节角）与正解 FK，替换 `main.cpp` 里「xyz 直接当角度」的临时做法。
-2. **电机计数映射**：关节角 → 电机计数需纳入减速比、零点偏移、转向（当前假设角度与计数线性 1:1）。
-3. **状态回读与发布**：在控制循环内读回电机实际位置/转速，正解出实际末端坐标后发布，替代当前「回显目标值」。
-4. **`task/arm_drive_task`**（[task/](delta_bottom/task/) 目前为空）：把驱动逻辑任务化，与规划/轨迹模块解耦。
+1. **把驱动逻辑接入 `ArmDriveTask`**：将当前注释掉的旧 `main()` 里的「读共享内存 → 角度换算 → `moveAbsolute` 下发 → 发布状态」搬进 `ArmDriveTask::run()`，恢复端到端 200 Hz 控制链路。
+2. **运动学正逆解**（[kinematics/src/Kinematics.cpp](delta_bottom/kinematics/src/Kinematics.cpp) 目前为空）：实现 delta 逆解 IK（末端 xyz → 三个关节角）与正解 FK，替换「xyz 直接当角度」的临时做法。
+3. **电机计数映射**：关节角 → 电机计数需纳入减速比、零点偏移、转向（当前假设角度与计数线性 1:1）。
+4. **状态回读与发布**：在控制循环内读回电机实际位置/转速，正解出实际末端坐标后发布，替代当前「回显目标值」。
 5. **共享内存无锁化（可选）**：用 seqlock 替代 System V 信号量，读者永不阻塞，更适合 200 Hz 实时循环。

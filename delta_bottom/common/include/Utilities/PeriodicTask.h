@@ -17,7 +17,8 @@ class PeriodicTaskManager;
 /*!
  * A single periodic task which will call run() at the given frequency
  */
-class PeriodicTask {
+class PeriodicTask 
+{
  public:
   PeriodicTask(PeriodicTaskManager* taskManager, float period,
                std::string name);
@@ -30,6 +31,9 @@ class PeriodicTask {
   virtual void run() = 0;
   virtual void cleanup() = 0;
   virtual ~PeriodicTask() { stop(); }
+
+  void set_bind_cpu(int id);
+  void set_sched_priority(int priority);
 
   /*!
    * Get the desired period for the task
@@ -77,6 +81,7 @@ class PeriodicTask {
  */
 class PeriodicTaskManager {
  public:
+  static PeriodicTaskManager *get_instance();
   PeriodicTaskManager() = default;
   ~PeriodicTaskManager();
   void addTask(PeriodicTask* task);

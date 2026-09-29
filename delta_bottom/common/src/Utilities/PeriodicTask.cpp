@@ -3,13 +3,16 @@
  * @brief Implementation of a periodic function running in a separate thread.
  * Periodic tasks have a task manager, which measure how long they take to run.
  */
-#ifdef linux
+#define _GNU_SOURCE 1
+
+#ifdef __linux__
  #include <sys/timerfd.h>
 #endif
 
 #include <unistd.h>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
 
 #include "Utilities/PeriodicTask.h"
 #include "Utilities/Timer.h"
@@ -28,6 +31,16 @@ PeriodicTask::PeriodicTask(PeriodicTaskManager* taskManager, float period,
   taskManager->addTask(this);
 }
 
+
+void PeriodicTask::set_bind_cpu(int id)
+{
+  _cpu_id_set = id;
+}
+
+void PeriodicTask::set_sched_priority(int priority)
+{
+  _schedule_param.sched_priority = priority;
+}
 
 void* PeriodicTask::func(void* p)
 {
@@ -153,6 +166,16 @@ void PeriodicTask::start() {
   _running = true;
 
   ret = pthread_create(&_thread_id, &_attr, &func, this);
+  if (ret == EPERM) {
+    // 实时调度(SCHED_FIFO)需要 root/CAP_SYS_NICE，权限不足时降级为普通调度重试
+    printf_color(PrintColor::Yellow,
+                 "[PeriodicTask] %s: 实时调度线程创建失败(%s)，降级为普通调度重试\n",
+                 _name.c_str(), strerror(ret));
+
+    pthread_attr_destroy(&_attr);
+    pthread_attr_init(&_attr);
+    ret = pthread_create(&_thread_id, &_attr, &func, this);
+  }
   if (ret != 0) {
     _running = false;
     printf_color(PrintColor::Red,
@@ -252,4 +275,14 @@ void PeriodicTaskManager::stopAll() {
   for (auto& task : _tasks) {
     task->stop();
   }
+}
+
+PeriodicTaskManager *PeriodicTaskManager::get_instance()
+{
+    static PeriodicTaskManager *ins = 0;
+    if(!ins)
+    {
+        ins = new PeriodicTaskManager();
+    }
+    return ins;
 }

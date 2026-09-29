@@ -1,5 +1,6 @@
 interface_task:
   task_thread:
+    thread_t: 0.005
     bind_cpu: 4
     thread_priority: 75
 
