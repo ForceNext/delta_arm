@@ -7,7 +7,8 @@ private:
     /* data */
 public:
     Kinematics(/* args */);
-    ~Kinematics();
+    ~Kinematics(); 
+
 };
 
 #endif

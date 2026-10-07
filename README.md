@@ -4,8 +4,8 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 
 ## 当前状态
 
-- **已实现（可运行）**：实时任务框架 `PeriodicTask`（`timerfd` 周期调度 + `SCHED_FIFO` 实时优先级 + CPU 亲和性绑定 + 线程生命周期管理）；串口驱动 `SerialPort`、Modbus 主站 `ModbusMaster`、电机控制封装 `MotorMapping`、上下位机共享内存 `ArmSharedMemory`。
-- **重构过渡中**：主循环已从旧的 `clock_nanosleep` 单线程循环迁移到 `PeriodicTask` 框架。当前 `ArmDriveTask`（`task/`）是**占位实现**——`run()` 只做 200 Hz 循环速率统计打印，**尚未接入串口 / Modbus / 电机控制**。完整的「读共享内存 → 下发电机」链路目前仍在注释掉的旧 `main()`（[user/main.cpp](delta_bottom/user/main.cpp) 顶部）里。
+- **已实现（可运行）**：实时任务框架 `PeriodicTask`（`timerfd` 周期调度 + `SCHED_FIFO` 实时优先级 + CPU 亲和性绑定 + 线程生命周期管理）；串口驱动 `SerialPort`、Modbus 主站 `ModbusMaster`、电机控制封装 `MotorMapping`、上下位机共享内存 `ArmSharedMemory`，以及机械臂驱动任务 `ArmDriveTask`（读共享内存 → 角度换算 → `moveAbsolute` 下发 → 发布状态）。
+- **控制链路已贯通**：主循环已从旧的 `clock_nanosleep` 单线程循环迁移到 `PeriodicTask` 框架。`ArmDriveTask::run()` 在 200 Hz 周期内完成「读 `ArmCommand` → 解析 xyz 目标角 → 角度×`DEG2CNT` 计数 → 逐台 `moveAbsolute` 下发 → 回写 `ArmStatus`」的端到端链路，串口 / Modbus / 电机控制均已接入。旧的注释版 `main()`（[user/main.cpp](delta_bottom/user/main.cpp) 顶部）已被取代，仅作历史参考。
 - **未实现**：运动学正逆解（delta 逆解 / 正解）。当前阶段把上位机下发的 `x/y/z` **直接当作三个电机的目标角度**（单位：度）下发电机，用于跑通链路与演示。
 
 ## 关键设计
@@ -19,7 +19,7 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 
 ## 架构与数据流
 
-### 目标链路
+### 控制链路
 
 ```
 上位机(独立进程，不在本工程)          本工程 delta_bottom                    电机 ×3
@@ -31,14 +31,14 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
   ◀─────── 发布 ArmStatus ────────  ④ 发布状态（回显目标值，非实测）
 ```
 
-> **注意**：上图为目标链路。当前 `ArmDriveTask::run()` 只做循环速率统计，①②③④ 尚未接入任务线程，仍保留在注释掉的旧 `main()` 中。
+> `ArmDriveTask` 在 `init()` 中完成共享内存连接与电机探测/使能，之后 `run()` 按 200 Hz 循环执行上图的 ①②③④。
 
 ### 分层调用链
 
 ```
 main.cpp（应用层：读 thread_config → 建 ArmDriveTask → 绑定 CPU/优先级 → start）
-   │ ArmDriveTask::run()（占位：print_loop_rate）
-   ▼（待接入）
+   │ ArmDriveTask::run()（读共享内存 → 角度换算 → moveAbsolute → 发布状态）
+   ▼
 MotorMapping（kinematics/：角度↔计数换算 + 扫描/使能/绝对位置，组命令码）
    │ writeRegisters() / readInputRegisters()
    ▼
@@ -81,7 +81,7 @@ SerialPort（drives/：termios 串口，8N1 原始模式，半双工 tcdrain）
 | `ModbusMaster` | `drives/` | 协议层：组帧 + CRC + 同步事务（发→收→校验） | ✅ 已实现 |
 | `MotorMapping` | `kinematics/` | 电机扫描/使能/运动控制 + 角度↔计数换算 | ✅ 已实现 |
 | `Kinematics`（IK/FK） | `kinematics/` | delta 逆解 / 正解 | 🚧 空占位 |
-| `arm_drive_task` | `task/` | 机械臂驱动任务（`PeriodicTask` 子类） | 🚧 占位（仅测速打印） |
+| `arm_drive_task` | `task/` | 机械臂驱动任务（`PeriodicTask` 子类）：读共享内存 → 角度换算 → `moveAbsolute` 下发 → 发布状态 | ✅ 已实现 |
 | `SharedMemory` / `sem_com` | `common/` | 上下位机共享内存 + System V 信号量互斥 | ✅ 已实现 |
 | 应用入口 | `user/main.cpp` | 读线程配置 → 建任务 → 保活 → 优雅退出 | ✅ 已实现 |
 
@@ -109,13 +109,13 @@ delta_arm/
     ├── kinematics/                   # 电机映射 + 正逆解库 libkinematics.a
     │   ├── include/{MotorMapping, Kinematics}.hpp
     │   └── src/{MotorMapping, Kinematics}.cpp
-    ├── task/                         # 机械臂驱动任务库 libtask.a（占位）
+    ├── task/                         # 机械臂驱动任务库 libtask.a（ArmDriveTask 控制循环）
     │   ├── include/arm_drive_task.hpp
     │   └── src/arm_drive_task.cpp
     ├── user/main.cpp                 # 应用入口：读线程配置 → 建任务 → 保活退出
     ├── third_party/yaml-cpp/         # 配置解析（vendored）
     └── tools/
-        ├── upper_sim.py              # Python 上位机模拟脚本（写角度，演示每秒一圈）
+        ├── set_angle.py              # Python 脚本：输入角度 → 写共享内存 → 电机转到对应角度
         ├── testpy.py                 # Python 调试脚本（读版本/位置/转速/状态）
         ├── 正点原子步进电机驱动器modbus-rtu控制协议V1.2(2).xlsx
         └── PDxxS1步进电机闭环驱动器用户手册_V1.0.pdf
@@ -214,21 +214,20 @@ ArmStatus st;
 shm.writeStatus(st);           // 底层写状态（加锁 → 写 → 解锁）
 ```
 
-### 上位机模拟脚本（`tools/upper_sim.py`）
+### 上位机指令脚本（`tools/set_angle.py`）
 
-真正的上位机就绪前，用 Python 脚本模拟上位机向共享内存写角度：
+真正的上位机就绪前，用 Python 脚本向共享内存发布目标角度：
 
 ```bash
 cd delta_bottom
-python3 tools/upper_sim.py            # x 轴(id1)每秒 1 圈
-python3 tools/upper_sim.py xyz        # x/y/z 三轴一起，每秒 1 圈
-python3 tools/upper_sim.py xy 2.0     # x/y 两轴，每秒 2 圈
+python3 tools/set_angle.py 30         # 三轴 x/y/z 都转到 30°
+python3 tools/set_angle.py 30 x       # 只有 x（id1）转到 30°，其余轴保持原值
+python3 tools/set_angle.py            # 不带参数则交互式输入角度
 ```
 
 - 先启动底层 `./build/delta_bottom`，再运行该脚本。
-- 脚本以 200 Hz 写入，角度按 `360 * rps / 200` 每拍累加；每秒打印各轴角度与底层回读的 `status.seq`（>0 表示链路已打通）。
-- 退出（Ctrl-C）时自动写 `mode=0`（空闲），底层停止下发。
 - 脚本用 `ctypes` 定义与 C++ 一致的 `ArmCommand/ArmStatus` 布局（共 128 字节），并用 System V 信号量（key `0x5A11`）加锁，与底层严格对齐。
+- 写入 `mode=1`、`seq+1`，仅更新指定轴的角度，其余轴保持原值；随后回显底层状态（`state`、`seq`）便于确认链路是否打通。
 
 ## 构建与运行
 
@@ -318,8 +317,7 @@ motors:                    # 电机（从站）列表
 
 以下为**尚未实现**的部分，供后续开发参考：
 
-1. **把驱动逻辑接入 `ArmDriveTask`**：将当前注释掉的旧 `main()` 里的「读共享内存 → 角度换算 → `moveAbsolute` 下发 → 发布状态」搬进 `ArmDriveTask::run()`，恢复端到端 200 Hz 控制链路。
-2. **运动学正逆解**（[kinematics/src/Kinematics.cpp](delta_bottom/kinematics/src/Kinematics.cpp) 目前为空）：实现 delta 逆解 IK（末端 xyz → 三个关节角）与正解 FK，替换「xyz 直接当角度」的临时做法。
-3. **电机计数映射**：关节角 → 电机计数需纳入减速比、零点偏移、转向（当前假设角度与计数线性 1:1）。
-4. **状态回读与发布**：在控制循环内读回电机实际位置/转速，正解出实际末端坐标后发布，替代当前「回显目标值」。
-5. **共享内存无锁化（可选）**：用 seqlock 替代 System V 信号量，读者永不阻塞，更适合 200 Hz 实时循环。
+1. **运动学正逆解**（[kinematics/src/Kinematics.cpp](delta_bottom/kinematics/src/Kinematics.cpp) 目前为空）：实现 delta 逆解 IK（末端 xyz → 三个关节角）与正解 FK，替换「xyz 直接当角度」的临时做法。
+2. **电机计数映射**：关节角 → 电机计数需纳入减速比、零点偏移、转向（当前假设角度与计数线性 1:1）。
+3. **状态回读与发布**：在控制循环内读回电机实际位置/转速，正解出实际末端坐标后发布，替代当前「回显目标值」。
+4. **共享内存无锁化（可选）**：用 seqlock 替代 System V 信号量，读者永不阻塞，更适合 200 Hz 实时循环。

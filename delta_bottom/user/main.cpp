@@ -161,7 +161,7 @@ int main(int argc, char** argv)
               << " cpu_id=" << cpu_id
               << " thread_priority=" << thread_priority << std::endl;
 
-    arm_drive_task = new ArmDriveTask(taskManager, thread_t, "ArmDriveTask");
+    arm_drive_task = new ArmDriveTask(taskManager, thread_t, "ArmDriveTask", argc, argv);
     arm_drive_task->set_bind_cpu(cpu_id);
     arm_drive_task->set_sched_priority(thread_priority);
 
