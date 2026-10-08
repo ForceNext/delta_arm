@@ -18,3 +18,13 @@ motors:
     speed_rpm: 1000
     accel: 200
 
+joint:
+  jointlength: #mm
+    - [100,150,250,50] #d1,L1,L2,d2 三个臂参数相同
+  
+  gear_ratio:
+    - [2.0,2.0,2.0] #三个主动臂传动比
+
+  
+
+  
