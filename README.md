@@ -81,7 +81,7 @@ SerialPort（drives/：termios 串口，8N1 原始模式，半双工 tcdrain）
 | `ModbusMaster` | `drives/` | 协议层：组帧 + CRC + 同步事务（发→收→校验） | ✅ 已实现 |
 | `MotorMapping` | `kinematics/` | 电机扫描/使能/运动控制 + 角度↔计数换算 | ✅ 已实现 |
 | `Kinematics`（IK/FK） | `kinematics/` | delta 逆解 / 正解 | 🚧 空占位 |
-| `arm_drive_task` | `task/` | 机械臂驱动任务（`PeriodicTask` 子类）：读共享内存 → 角度换算 → `moveAbsolute` 下发 → 发布状态 | ✅ 已实现 |
+| `arm_drive_task` | `user/task/` | 机械臂驱动任务（`PeriodicTask` 子类）：读共享内存 → 角度换算 → `moveAbsolute` 下发 → 发布状态 | ✅ 已实现 |
 | `SharedMemory` / `sem_com` | `common/` | 上下位机共享内存 + System V 信号量互斥 | ✅ 已实现 |
 | 应用入口 | `user/main.cpp` | 读线程配置 → 建任务 → 保活 → 优雅退出 | ✅ 已实现 |
 
@@ -109,10 +109,12 @@ delta_arm/
     ├── kinematics/                   # 电机映射 + 正逆解库 libkinematics.a
     │   ├── include/{MotorMapping, Kinematics}.hpp
     │   └── src/{MotorMapping, Kinematics}.cpp
-    ├── task/                         # 机械臂驱动任务库 libtask.a（ArmDriveTask 控制循环）
-    │   ├── include/arm_drive_task.hpp
-    │   └── src/arm_drive_task.cpp
-    ├── user/main.cpp                 # 应用入口：读线程配置 → 建任务 → 保活退出
+    ├── user/                         # 应用层（入口 + 驱动任务）
+    │   ├── main.cpp                  # 应用入口：读线程配置 → 建任务 → 保活退出
+    │   └── task/                     # 机械臂驱动任务库 libtask.a（ArmDriveTask 控制循环）
+    │       ├── CMakeLists.txt
+    │       ├── include/arm_drive_task.hpp
+    │       └── src/arm_drive_task.cpp
     ├── third_party/yaml-cpp/         # 配置解析（vendored）
     └── tools/
         ├── set_angle.py              # Python 脚本：输入角度 → 写共享内存 → 电机转到对应角度

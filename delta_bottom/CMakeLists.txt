@@ -51,9 +51,9 @@ add_subdirectory(drives)
 add_subdirectory(kinematics)
 
 # ---------------------------------------------------------------------------
-# task: 机械臂驱动任务（arm_drive_task）
+# user/task: 机械臂驱动任务（arm_drive_task）
 # ---------------------------------------------------------------------------
-add_subdirectory(task)
+add_subdirectory(user/task)
 
 # ---------------------------------------------------------------------------
 # Application
