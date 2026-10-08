@@ -27,6 +27,12 @@ private:
     double time_start_sec_;
     float dt;
 
+    Timer modbus_timer_;              // 测量单次 Modbus 事务耗时
+    double mb_max_ms_ = 0.0;          // 统计窗口内单次事务最大耗时（ms）
+    double mb_sum_ms_ = 0.0;          // 统计窗口内事务总耗时（ms）
+    uint32_t mb_count_ = 0;           // 统计窗口内事务次数
+    uint32_t mb_loops_ = 0;           // 统计窗口内循环次数
+
     SerialPort port_;                      // 串口（按 argc/argv 读取 hardware_config.yaml）
     ModbusMaster master_;                  // Modbus 主站（基于 port_）
     ArmSharedMemory shm_;                  // 上下位机共享内存（命令/状态）

@@ -98,8 +98,14 @@ void ArmDriveTask::run()
     if (cmd.mode == 1 && reachable) {
         for (size_t i = 0; i < g_addr.size() && i < 3; ++i) {
             // 下发绝对位置：方向 0=正转，加减速 MOVE_ACCEL，速度 MOVE_SPEED
-            if (!MotorMapping::moveAbsolute(master_, g_addr[i], counts[i],
-                                            0, MOVE_ACCEL, MOVE_SPEED))
+            modbus_timer_.start();
+            bool ok = MotorMapping::moveAbsolute(master_, g_addr[i], counts[i],
+                                                 0, MOVE_ACCEL, MOVE_SPEED);
+            double t_ms = modbus_timer_.getMs();
+            mb_sum_ms_ += t_ms;
+            if (t_ms > mb_max_ms_) mb_max_ms_ = t_ms;
+            ++mb_count_;
+            if (!ok)
                 ++g_err[i];
         }
     }
@@ -121,6 +127,22 @@ void ArmDriveTask::run()
     }
 
     ++cycle_;
+
+    // 周期性打印 Modbus 事务耗时统计（每 1000 拍 ≈ 5 s）
+    if (++mb_loops_ >= 1000) {
+        if (mb_count_ > 0) {
+            printf_color(PrintColor::Yellow,
+                "[Modbus] 1000 loops: %u 次事务 | 平均 %.3f ms/次 | 最大 %.3f ms/次 | 每拍合计 %.3f ms\n",
+                mb_count_, mb_sum_ms_ / mb_count_, mb_max_ms_, mb_sum_ms_ / 1000.0);
+        } else {
+            printf_color(PrintColor::Yellow,
+                "[Modbus] 1000 loops: 0 次事务（无电机或 mode!=1）\n");
+        }
+        mb_sum_ms_ = 0.0;
+        mb_max_ms_ = 0.0;
+        mb_count_ = 0;
+        mb_loops_ = 0;
+    }
 }
 
 void ArmDriveTask::cleanup()
