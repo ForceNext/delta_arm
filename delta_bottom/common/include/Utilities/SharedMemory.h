@@ -27,25 +27,25 @@
 // System V 信号量 key（上下位机必须使用同一个 key，任意非零整数，避免与其他程序冲突）
 #define ARM_SEM_KEY 0x5A11
 
-// 上位机 -> 底层：命令（xyz 直接作为三个电机的目标角度，单位：度）
-struct ArmCommand 
+// 上位机 -> 底层：命令（xyz 是末端目标坐标，单位 mm，z 正方向向上）
+struct ArmCommand
 {
   uint64_t seq = 0;   // 写入序号（每次写 +1）
-  uint8_t mode = 0;   // 0=空闲  1=位置模式（把 xyz 当角度下发）
-  double x = 0.0;     // 电机 id1 目标角度（度）
-  double y = 0.0;     // 电机 id2 目标角度（度）
-  double z = 0.0;     // 电机 id3 目标角度（度）
+  uint8_t mode = 0;   // 0=空闲  1=位置模式（底层逆解后下发关节角）
+  double x = 0.0;     // 末端 x 坐标（mm）
+  double y = 0.0;     // 末端 y 坐标（mm）
+  double z = 0.0;     // 末端 z 坐标（mm，正方向向上，平台在基座下方为负）
 };
 
 // 底层 -> 上位机：状态
-struct ArmStatus 
+struct ArmStatus
 {
   uint64_t seq = 0;                  // 写入序号
   uint8_t state = 0;                 // 0=空闲 1=运行
   uint8_t online[3] = {0, 0, 0};     // 各电机在线标志
-  double theta[3] = {0, 0, 0};       // 实际下发的三个目标角度（度）
+  double theta[3] = {0, 0, 0};       // 实际下发的三个电机角（度，已乘传动比）
   double motor_pos[3] = {0, 0, 0};   // 实际下发的电机位置（计数）
-  double x = 0.0, y = 0.0, z = 0.0;  // 回显坐标
+  double x = 0.0, y = 0.0, z = 0.0;  // 回显末端坐标（mm）
 };
 
 // 共享内存布局：锁不放在这里 —— sem_com 是独立的 System V 信号量，用 key 标识，

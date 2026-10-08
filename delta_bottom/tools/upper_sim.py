@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-向共享内存发布一个末端目标坐标（mm），底层 delta_bottom 逆解后驱动电机。
+上位机模拟脚本：持续向共享内存发布末端坐标 (x,y,z)，让 delta 机械臂走圆。
 
-底层 ArmDriveTask 读共享内存里的 x/y/z，当作末端坐标（单位 mm，z 正方向向上，
-平台在基座下方为负），逆解出三个关节角、乘传动比后下发到电机（mode=1 时生效）。
+底层 ArmDriveTask 以 200Hz 读共享内存里的 x/y/z，当作末端坐标（单位 mm，
+z 正方向向上，平台在基座下方为负），逆解出关节角、乘传动比后下发到电机。
 
 共享内存 / 信号量参数与底层一致：
   - 共享内存名：/delta_arm      （POSIX shm_open，对应 /dev/shm/delta_arm）
   - 信号量 key ：0x5A11         （System V 信号量，= ARM_SEM_KEY）
 
 用法：
-  python3 set_angle.py 0 0 -200        # 末端移动到 (0, 0, -200) mm
-  python3 set_angle.py                 # 不带参数则交互式输入 x/y/z
+  python3 upper_sim.py                     # 默认：半径 30mm、高度 -250mm、50Hz、0.25 圈/秒
+  python3 upper_sim.py 30 -250 50 0.5      # 半径 / 高度 / 频率 / 圈速
+Ctrl+C 退出；退出前自动写 mode=0（空闲），底层停止下发。
 """
 
 import os
 import sys
+import time
+import signal
+import math
 import ctypes
 import ctypes.util
 import mmap
@@ -129,40 +133,78 @@ def shm_map():
 
 
 def parse_args():
-    """返回 (x, y, z) 末端目标坐标（mm）。"""
-    if len(sys.argv) >= 4:
-        x = float(sys.argv[1])
-        y = float(sys.argv[2])
-        z = float(sys.argv[3])
-    else:
-        x = float(input("末端 x (mm): ").strip())
-        y = float(input("末端 y (mm): ").strip())
-        z = float(input("末端 z (mm，向下为负): ").strip())
-    return x, y, z
+    """返回 (radius_mm, z_mm, rate_hz, rev_per_sec)。"""
+    radius = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
+    z      = float(sys.argv[2]) if len(sys.argv) > 2 else -250.0
+    rate   = float(sys.argv[3]) if len(sys.argv) > 3 else 50.0
+    rev    = float(sys.argv[4]) if len(sys.argv) > 4 else 0.25
+    return radius, z, rate, rev
 
 
 def main():
-    x, y, z = parse_args()
+    radius, z, rate, rev = parse_args()
 
     semid = sem_open(SEM_KEY)
     mm = shm_map()
     data = ArmSharedData.from_buffer(mm)
 
-    # 加锁后写入末端坐标；seq +1，mode 置 1
-    sem_p(semid)
-    data.command.mode = 1
-    data.command.seq += 1
-    data.command.x = x
-    data.command.y = y
-    data.command.z = z
-    rx, ry, rz = data.command.x, data.command.y, data.command.z
-    state = data.status.state
-    bottom_seq = data.status.seq
-    sem_v(semid)
+    running = True
 
-    print(f"已发布末端坐标 ({x:.2f}, {y:.2f}, {z:.2f}) mm")
-    print(f"  回显 x={rx:.2f} y={ry:.2f} z={rz:.2f}  mode=1")
-    print(f"  底层状态 state={state}，回读 seq={bottom_seq}")
+    def on_exit(sig, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, on_exit)
+    signal.signal(signal.SIGTERM, on_exit)
+
+    period = 1.0 / rate
+    deg_per_tick = 360.0 * rev / rate     # 每拍增加的角度
+
+    print(f"上位机模拟启动：半径 {radius}mm、高度 {z}mm、{rate}Hz、{rev} 圈/秒")
+    print(f"共享内存 /dev/shm{SHM_NAME}，信号量 key=0x{SEM_KEY:X}，结构体 {DATA_SIZE} 字节")
+
+    seq = 0
+    angle = 0.0
+    t0 = time.monotonic()
+    next_t = t0 + period
+    last_report = t0
+
+    try:
+        while running:
+            seq += 1
+            angle += deg_per_tick
+            x = radius * math.cos(math.radians(angle))
+            y = radius * math.sin(math.radians(angle))
+
+            sem_p(semid)
+            data.command.mode = 1
+            data.command.seq = seq
+            data.command.x = x
+            data.command.y = y
+            data.command.z = z
+            sx, sy, sz = data.status.x, data.status.y, data.status.z
+            bottom_seq = data.status.seq    # 底层回读序号（>0 说明底层在消费）
+            sem_v(semid)
+
+            now = time.monotonic()
+            if now - last_report >= 1.0:
+                last_report = now
+                print(f"t={now - t0:5.1f}s  目标=({x:6.1f},{y:6.1f},{z:6.1f})  "
+                      f"回显=({sx:6.1f},{sy:6.1f},{sz:6.1f})  底层seq={bottom_seq}")
+
+            # 睡到下一个周期边界，避免累积漂移
+            next_t += period
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_t = time.monotonic() + period
+    finally:
+        # 退出前置空闲，底层停止下发
+        sem_p(semid)
+        data.command.mode = 0
+        sem_v(semid)
+        print("已写 mode=0（空闲），退出")
 
 
 if __name__ == "__main__":

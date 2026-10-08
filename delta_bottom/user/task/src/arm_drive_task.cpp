@@ -10,7 +10,8 @@ ArmDriveTask::ArmDriveTask(PeriodicTaskManager* taskManager, float period, std::
     : PeriodicTask(taskManager, period, name),
       port_(argc, argv),
       master_(port_),
-      hw_cfg_((argc > 1) ? argv[1] : "configs/hardware_config.yaml")
+      hw_cfg_((argc > 1) ? argv[1] : "configs/hardware_config.yaml"),
+      kin_(Kinematics::fromYaml(hw_cfg_))
 {
     master_.resp_timeout_ms = 20;
 
@@ -75,24 +76,26 @@ void ArmDriveTask::run()
 {
     print_loop_rate();
 
-    // 1) 读上位机命令：xyz 直接作为三个电机的目标角度（单位：度）
+    // 1) 读上位机命令：x/y/z 是末端目标坐标（mm，z 正方向向上，平台在基座下方为负）
     ArmCommand cmd;
     shm_.readCommand(cmd);
 
-    // 共享内存 → 三个目标角度
-    target_[0] = cmd.x;
-    target_[1] = cmd.y;
-    target_[2] = cmd.z;
-
-    // 2) 角度 → 电机计数，逐台下发
+    // 2) 逆解：末端坐标 → 三个关节角 → ×传动比 → 电机计数
     uint32_t counts[3] = {0, 0, 0};
-    for (int i = 0; i < 3; ++i)
-        counts[i] = (uint32_t)std::llround(MotorMapping::angleToMotorPos(target_[i]));
+    double fk_xyz[3] = {cmd.x, cmd.y, cmd.z};   // 回显坐标，默认用目标值，正解成功后覆盖
+    bool reachable = kin_.kinematics_ik(cmd.x, cmd.y, cmd.z);
+    if (reachable) {
+        for (int i = 0; i < 3; ++i)
+            counts[i] = (uint32_t)std::llround(
+                MotorMapping::angleToMotorPos(kin_.motorTheta(i)));
+        // 正解：由解算出的关节角反推末端坐标，作为回显
+        kin_.kinematics_fk(fk_xyz);
+    }
 
     const auto& g_addr = MotorMapping::addrs();
     auto& g_err = MotorMapping::errs();
 
-    if (cmd.mode == 1) {
+    if (cmd.mode == 1 && reachable) {
         for (size_t i = 0; i < g_addr.size() && i < 3; ++i) {
             // 下发绝对位置：方向 0=正转，加减速 MOVE_ACCEL，速度 MOVE_SPEED
             if (!MotorMapping::moveAbsolute(master_, g_addr[i], counts[i],
@@ -101,17 +104,19 @@ void ArmDriveTask::run()
         }
     }
 
-    // 3) 发布状态（在线 + 目标位置 + 回显坐标）
+    // 3) 发布状态（在线 + 电机角 + 回显坐标）
     {
         ArmStatus st{};
         st.seq = cycle_;
-        st.state = (cmd.mode == 1) ? 1 : 0;
+        st.state = (cmd.mode == 1 && reachable) ? 1 : 0;
         for (size_t i = 0; i < g_addr.size() && i < 3; ++i) {
             st.online[i] = 1;
-            st.theta[i] = target_[i];
-            st.motor_pos[i] = (double)counts[i];
+            if (reachable) {
+                st.theta[i] = kin_.motorTheta(i);      // 实际下发的电机角（度，含传动比）
+                st.motor_pos[i] = (double)counts[i];
+            }
         }
-        st.x = cmd.x; st.y = cmd.y; st.z = cmd.z;
+        st.x = fk_xyz[0]; st.y = fk_xyz[1]; st.z = fk_xyz[2];
         shm_.writeStatus(st);
     }
 
