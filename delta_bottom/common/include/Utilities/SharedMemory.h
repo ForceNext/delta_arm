@@ -19,6 +19,7 @@
 #include <string>
 
 #include "Utilities/sem_com.h"
+#include "Utilities/Utilities_print.h"
 
 // 共享内存名称（shm_open 的名字须以 '/' 开头）
 #define ARM_SHARED_MEMORY_NAME "/delta_arm"
@@ -81,13 +82,18 @@ class SharedMemoryObject
     _size = sizeof(T);
     printf("[Shared Memory] open new %s, size %zu bytes\n", name.c_str(), _size);
 
-    _fd = shm_open(name.c_str(), O_RDWR | O_CREAT,
-                   S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH);
-    if (_fd == -1) 
+    _fd = shm_open(name.c_str(), O_RDWR | O_CREAT, 0666);
+    if (_fd == -1)
     {
       printf("[ERROR] SharedMemoryObject shm_open failed: %s\n", strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
     }
+    // 上下位机可能以不同用户运行（如底层 root、上位机普通用户）。
+    // shm_open 的模式会被进程 umask 掩码，这里用 fchmod 固定为 0666（不受 umask 影响），
+    // 保证双方都能读写该共享内存。
+    if (fchmod(_fd, 0666) == -1)
+      printf("[ERROR] SharedMemoryObject fchmod(%s) failed: %s\n",
+             name.c_str(), strerror(errno));
 
     struct stat s;
     if (fstat(_fd, &s)) 
@@ -144,10 +150,13 @@ class SharedMemoryObject
            _size);
     _fd = shm_open(name.c_str(), O_RDWR,
                    S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH);
-    if (_fd == -1) 
+    if (_fd == -1)
     {
-      printf("[ERROR] SharedMemoryObject::attach shm_open(%s) failed: %s\n",
-             _name.c_str(), strerror(errno));
+      // 共享内存尚不存在（首次启动或已被删除）——预期情况，connect() 会转而 createNew 新建；
+      // 这里用黄色告警而非红色错误，避免误导。
+      printf_color(PrintColor::Yellow,
+                   "[WARN] SharedMemoryObject::attach %s 失败(%s)，将尝试新建\n",
+                   _name.c_str(), strerror(errno));
       throw std::runtime_error("Failed to create shared memory!");
     }
 

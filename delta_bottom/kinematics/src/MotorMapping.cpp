@@ -120,12 +120,18 @@ void MotorMapping::detectMotors(ModbusMaster& master)
         if (master.readInputRegisters(a, Cmd::READ_POS, 2, buf))
             g_addr.push_back(a);
     }
-    if (g_addr.empty()) {
+    bool fell_back = g_addr.empty();
+    if (fell_back) {
         std::cerr << "未探测到任何在线电机，退回配置地址\n";
         g_addr = g_cfg_addr;
     }
+
     g_err.assign(g_addr.size(), 0);
-    std::cout << "探测到 " << g_addr.size() << " 台在线电机\n";
+
+    if (fell_back)
+        std::cout << "使用配置地址 " << g_addr.size() << " 台（非实测在线）\n";
+    else
+        std::cout << "探测到 " << g_addr.size() << " 台在线电机\n";
 }
 
 
