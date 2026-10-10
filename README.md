@@ -4,8 +4,9 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 
 ## 当前状态
 
-- **已实现（可运行）**：实时任务框架 `PeriodicTask`（`timerfd` 周期调度 + `SCHED_FIFO` 实时优先级 + CPU 亲和性绑定 + 线程生命周期管理）；串口驱动 `SerialPort`、Modbus 主站 `ModbusMaster`、电机控制封装 `MotorMapping`、delta 正逆解 `Kinematics`、上下位机共享内存 `ArmSharedMemory`，以及机械臂驱动任务 `ArmDriveTask`（读共享内存 → 逆解 → `moveAbsolute` 下发 → 发布状态）。
-- **控制链路已贯通**：主循环已从旧的 `clock_nanosleep` 单线程循环迁移到 `PeriodicTask` 框架。`ArmDriveTask::run()` 在 200 Hz 周期内完成「读 `ArmCommand`（末端坐标）→ 逆解关节角 → ×传动比 → `DEG2CNT` 计数 → 逐台 `moveAbsolute` 下发 → 回写 `ArmStatus`」的端到端链路。旧的注释版 `main()`（[user/main.cpp](delta_bottom/user/main.cpp) 顶部）已被取代，仅作历史参考。
+- **已实现（可运行）**：实时任务框架 `PeriodicTask`（`timerfd` 周期调度 + `SCHED_FIFO` 实时优先级 + CPU 亲和性绑定 + 线程生命周期管理）；串口驱动 `SerialPort`、Modbus 主站 `ModbusMaster`、电机控制封装 `MotorMapping`、delta 正逆解 `Kinematics`、上下位机共享内存 `ArmSharedMemory`，以及机械臂驱动任务 `ArmDriveTask`（在线监测/初始化 → 逆解 → `moveAbsolute` 下发 → 发布状态）。
+- **控制链路已贯通**：主循环已从旧的 `clock_nanosleep` 单线程循环迁移到 `PeriodicTask` 框架。`ArmDriveTask::run()` 在 200 Hz 周期内完成「读 `ArmCommand`（末端坐标）→ 逆解关节角 → ×传动比 → `DEG2CNT` 计数 → 逐台 `moveAbsolute` 下发 → 回写 `ArmStatus`」的端到端链路。
+- **在线监测与初始化**：启动时持续探测 3 台电机，全部上线后逐台初始化（设置协议 `0x69`=modbus、设置细分 `0x65`=16），初始化完成才使能并进入运动控制；运行中连续无应答（默认 5 次）判定掉线，对在线电机执行刹车保持（`0xFC`，不失能）并停机，周期重探等待恢复。
 - **未实现**：电机**零点偏移与转向标定**（当前 `θ=0` 直接对应上臂水平、电机角 = 关节角 × 传动比，尚未纳入各臂零点偏置/反向）；以及读回电机实际位置做正解回发（当前状态回显的是命令关节角正解出的坐标，非实测）。
 
 ## 关键设计
@@ -15,7 +16,8 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 - **通信协议**：Modbus RTU（实际使用 `04H` 读输入寄存器 / `06H` 写单寄存器 / `10H` 写多寄存器）
 - **驱动器**：正点原子 PDxxS1 闭环步进驱动器，位置分辨率 `51200` = 一圈（360°）
 - **上下位机通信**：POSIX 共享内存（`shm_open` + `mmap`）+ System V 信号量互斥（key `0x5A11`）
-- **启动探测**：逐个读 `0x2A`（实时位置）探测在线电机，只控制探测到的从站
+- **在线探测**：读 `0x2A`（实时位置）判断电机在线；启动时持续探测，全部上线才初始化并运动
+- **掉线保护**：运行中连续无应答（默认 5 次）判定掉线，`stopMotor` 刹车保持（不失能），避免末端掉落
 
 ## 架构与数据流
 
@@ -31,17 +33,17 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
   ◀─────── 发布 ArmStatus ────────  ④ 发布状态（回显正解坐标，非实测）
 ```
 
-> `ArmDriveTask` 在 `init()` 中完成共享内存连接与电机探测/使能，之后 `run()` 按 200 Hz 循环执行上图的 ①②③④。
+> `ArmDriveTask` 在 `init()` 中完成共享内存连接与配置读取；`run()` 先走「等待上电 → 初始化（协议+细分）→ 使能」的启动流程，就绪后按 200 Hz 循环执行上图的 ①②③④，并在运行中持续监测电机在线状态。
 
 ### 分层调用链
 
 ```
 main.cpp（应用层：读 thread_config → 建 ArmDriveTask → 绑定 CPU/优先级 → start）
-   │ ArmDriveTask::run()（读共享内存 → 逆解 → moveAbsolute → 发布状态）
+   │ ArmDriveTask::run()（在线监测/初始化 → 逆解 → moveAbsolute → 发布状态）
    ▼
 Kinematics（kinematics/：末端 xyz ↔ 关节角正逆解，逆解 × 传动比）
    ▼
-MotorMapping（kinematics/：角度↔计数换算 + 扫描/使能/绝对位置，组命令码）
+MotorMapping（kinematics/：在线探测/初始化/使能/运动控制 + 角度↔计数换算，组命令码）
    │ writeRegisters() / readInputRegisters()
    ▼
 ModbusMaster（drives/：组帧 + CRC-16 + 发送 + 两段超时收应答 + 校验）
@@ -81,9 +83,9 @@ SerialPort（drives/：termios 串口，8N1 原始模式，半双工 tcdrain）
 | `PeriodicTask` / `PeriodicTaskManager` | `common/` | 实时任务框架：周期调度 + 实时优先级 + CPU 亲和性 + 线程生命周期 | ✅ 已实现 |
 | `SerialPort` | `drives/` | 硬件层：termios 串口 8N1、`tcdrain` 半双工、`readExact` 按帧长精确收帧 | ✅ 已实现 |
 | `ModbusMaster` | `drives/` | 协议层：组帧 + CRC + 同步事务（发→收→校验） | ✅ 已实现 |
-| `MotorMapping` | `kinematics/` | 电机扫描/使能/运动控制 + 角度↔计数换算 | ✅ 已实现 |
+| `MotorMapping` | `kinematics/` | 在线探测/初始化/使能/运动控制 + 角度↔计数换算 | ✅ 已实现 |
 | `Kinematics`（IK/FK） | `kinematics/` | delta 逆解（末端 xyz → 关节角）/ 正解（三球交） | ✅ 已实现 |
-| `arm_drive_task` | `user/task/` | 机械臂驱动任务（`PeriodicTask` 子类）：读共享内存 → 逆解 → `moveAbsolute` 下发 → 发布状态 | ✅ 已实现 |
+| `arm_drive_task` | `user/task/` | 机械臂驱动任务（`PeriodicTask` 子类）：在线监测/初始化 → 逆解 → `moveAbsolute` 下发 → 发布状态 + 掉线停机 | ✅ 已实现 |
 | `SharedMemory` / `sem_com` | `common/` | 上下位机共享内存 + System V 信号量互斥 | ✅ 已实现 |
 | 应用入口 | `user/main.cpp` | 读线程配置 → 建任务 → 保活 → 优雅退出 | ✅ 已实现 |
 
@@ -122,8 +124,9 @@ delta_arm/
         ├── set_angle.py              # Python 脚本：输入末端坐标 → 写共享内存 → 逆解驱动电机
         ├── upper_sim.py              # Python 上位机模拟脚本：持续发布末端坐标走圆
         ├── testpy.py                 # Python 调试脚本（读版本/位置/转速/状态）
-        ├── 正点原子步进电机驱动器modbus-rtu控制协议V1.2(2).xlsx
-        └── PDxxS1步进电机闭环驱动器用户手册_V1.0.pdf
+        └── docs/                     # 驱动协议与手册
+            ├── 正点原子步进电机驱动器modbus-rtu控制协议V1.2(2).xlsx
+            └── PDxxS1步进电机闭环驱动器用户手册_V1.0.pdf
 ```
 
 ## 通信协议
@@ -137,6 +140,8 @@ delta_arm/
 | `0x2A` | 读实时位置（int32，`51200` = 一圈） |
 | `0x2C` | 读运行状态 |
 | `0x62` | 设置工作模式（0=通信位置 … 7=回零） |
+| `0x65` | 设置细分（1~256） |
+| `0x69` | 设置协议（0=自定义 / 1=modbus / 2=canopen） |
 | `0xF2` | 闭环绝对位置模式控制 |
 | `0xF3` | 闭环相对位置模式控制 |
 | `0xFA` | 使能控制（0=使能 / 1=失能） |
@@ -160,7 +165,9 @@ delta_arm/
 
 | 方法 | 功能 | 命令码 |
 | --- | --- | --- |
-| `loadMotorAddrs()` / `detectMotors()` | 读配置地址 / 探测在线电机 | `0x2A` |
+| `loadMotorAddrs()` | 从 yaml 读候选电机地址 | — |
+| `probeMotor()` / `allOnline()` | 读 `0x2A` 探测单台在线 / 判断是否全部在线 | `0x2A` |
+| `initMotor()`（`setProtocol` + `setSubdivision`） | 初始化：设置协议(modbus) + 设置细分(16) | `0x69` + `0x65` |
 | `setMotorEnable()` / `enableMotors()` | 单台 / 全部使能（失能） | `0xFA` |
 | `SetMotorMode()` | 设置工作模式 | `0x62` |
 | `moveAbsolute()` / `moveRelative()` | 绝对 / 相对位置控制 | `0xF2` / `0xF3` |
@@ -321,7 +328,7 @@ joint:                     # delta 几何参数
 ```
 
 - `serial.port` / `serial.baudrate`：串口与波特率。
-- `motors[].addr`：驱动器从站地址；程序启动时逐个探测，**只控制在线者**，未连接的地址不会拖慢循环。
+- `motors[].addr`：驱动器从站地址；程序启动时持续探测，**等所有配置的电机都上线**才初始化并运动，任一掉线则停机。
 - `joint.jointlength`：基座半径 `d1`、上臂长 `L1`、前臂长 `L2`、动平台半径 `d2`（mm），由 `Kinematics::fromYaml` 读取用于正逆解。
 - `joint.gear_ratio`：三个主动臂传动比；逆解出的关节角乘它得到电机角。
 - `motors[].name` / `speed_rpm` / `accel` 为预留字段，暂未在控制循环中使用（加减速/速度用 `arm_drive_task.cpp` 里的 `MOVE_ACCEL` / `MOVE_SPEED`）。

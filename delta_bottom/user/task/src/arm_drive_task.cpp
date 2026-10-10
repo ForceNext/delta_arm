@@ -6,6 +6,7 @@ constexpr uint8_t  MOVE_ACCEL = 200;
 constexpr uint16_t MOVE_SPEED = 1000;
 constexpr uint32_t OFFLINE_FAIL_LIMIT = 5;   // 连续失败 5 次判定掉线
 constexpr uint32_t REPROBE_PERIOD    = 200;  // 停机后每 200 拍（≈1s）重探一次
+constexpr uint32_t WAIT_PROBE_PERIOD = 20;   // 等待电机上电时每 20 拍（≈100ms）探测一次
 
 ArmDriveTask::ArmDriveTask(PeriodicTaskManager* taskManager, float period, std::string name,
                            int argc, char** argv)
@@ -66,17 +67,17 @@ void ArmDriveTask::init()
     cycle_ = 0;
     time_ctrl.start();
 
-    // 复位掉线停机状态
+    // 复位掉线停机 / 等待上电状态
     for (int i = 0; i < 3; ++i) consec_fail_[i] = 0;
     emergency_stop_ = false;
     reprobe_counter_ = 0;
+    motors_ready_ = false;
+    prev_online_mask_ = 0;
 
     shm_.connect();  // 连接共享内存：首次创建，其余附加
 
-    // 探测并使能所有在线电机
+    // 只读配置里的电机地址；在线探测与使能放到 run()，等全部在线再使能
     MotorMapping::loadMotorAddrs(hw_cfg_);
-    MotorMapping::detectMotors(master_);
-    MotorMapping::enableMotors(master_);
 }
 
 void ArmDriveTask::run()
@@ -87,6 +88,54 @@ void ArmDriveTask::run()
     shm_.readCommand(cmd);
 
     double fk_xyz[3] = {cmd.x, cmd.y, cmd.z};   // 回显坐标，默认用目标值
+
+    // ===== 等待电机上电：持续探测，全部在线才使能并转入运行 =====
+    if (!motors_ready_) {
+        if (++reprobe_counter_ >= WAIT_PROBE_PERIOD) {
+            reprobe_counter_ = 0;
+            for (int id = 1; id <= 3; ++id) {
+                if (MotorMapping::probeMotor(master_, id)) {
+                    MotorMapping::setOnline(id, true);
+                    consec_fail_[id - 1] = 0;
+                } else {
+                    // 多次无返回才判定不在线（避免单次干扰）
+                    if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT)
+                        MotorMapping::setOnline(id, false);
+                }
+            }
+
+            uint8_t mask = 0;
+            for (int id = 1; id <= 3; ++id)
+                if (MotorMapping::isOnline(id)) mask |= (uint8_t)(1u << (id - 1));
+            if (mask != prev_online_mask_) {
+                prev_online_mask_ = mask;
+                printf_color(PrintColor::Yellow,
+                    "[DriveTask] 等待电机上电：在线 %d%d%d\n",
+                    (mask & 1) ? 1 : 0, (mask & 2) ? 1 : 0, (mask & 4) ? 1 : 0);
+            }
+
+            if (MotorMapping::allOnline()) {
+                // 初始化：设置协议(modbus) + 设置细分(16)，全部成功才使能
+                bool all_init_ok = true;
+                for (int id = 1; id <= 3; ++id) {
+                    if (!MotorMapping::initMotor(master_, id)) {
+                        all_init_ok = false;
+                        printf_color(PrintColor::Red,
+                            "[DriveTask] 电机 %d 初始化失败，下拍重试\n", id);
+                    }
+                }
+                if (all_init_ok) {
+                    MotorMapping::enableMotors(master_);
+                    motors_ready_ = true;
+                    printf_color(PrintColor::Green,
+                        "[DriveTask] 全部在线并初始化完成，已使能，开始运行\n");
+                }
+            }
+        }
+        publishStatus(cmd, false, nullptr, fk_xyz);
+        ++cycle_;
+        return;
+    }
 
     // ===== 掉线停机状态：不下发，只周期重探离线电机，等人工重启 =====
     if (emergency_stop_) {

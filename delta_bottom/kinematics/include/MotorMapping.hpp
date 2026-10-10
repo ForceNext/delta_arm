@@ -24,6 +24,8 @@ namespace Cmd {
     constexpr uint16_t REL_POS      = 0x00F3;  // 相对位置模式控制
     constexpr uint16_t CLEAR_STATUS = 0x00FB;  // 清除状态（堵转/刹车/失能）
     constexpr uint16_t STOP         = 0x00FC;  // 立即停止（刹车）
+    constexpr uint16_t SET_PROTOCOL    = 0x0069;  // 设置协议：0=自定义 1=modbus 2=canopen
+    constexpr uint16_t SET_SUBDIVISION = 0x0065;  // 设置细分：1~256
 }
 
 // ---------------------------------------------------------------------------
@@ -39,13 +41,11 @@ public:
     MotorMapping() = default;
     ~MotorMapping() = default;
 
-    // —— 扫描 / 探测电机 ——
+    // —— 配置地址 ——
     static void loadMotorAddrs(const std::string& path);  // 从 yaml 读候选地址到 g_cfg_addr
-    static void detectMotors(ModbusMaster& master);       // 逐个读实时位置，探测在线电机
 
-    // 探测结果访问（供控制循环使用）
-    static const std::vector<uint8_t>& addrs() { return g_addr; }  // 在线从站地址
-    static uint64_t (&errs())[3] { return g_err; }                 // 每台累计失败次数（下标 = 地址-1）
+    // 在线状态 / 失败计数访问（供控制循环使用）
+    static uint64_t (&errs())[3] { return g_err; }        // 每台累计失败次数（下标 = 地址-1）
 
     // 运行时在线状态（下标 = 从站地址-1，即电机号-1）
     static bool isOnline(int motorId) { return g_online[motorId - 1]; }
@@ -57,6 +57,11 @@ public:
     static double angleToMotorPos(double angle); // 关节角度（度）→ 电机计数
 
     static bool SetMotorMode(ModbusMaster& master, int motorId, int mode);
+
+    // —— 初始化（协议 + 细分）——
+    static bool setProtocol(ModbusMaster& master, int motorId, uint16_t protocol);
+    static bool setSubdivision(ModbusMaster& master, int motorId, uint16_t subdivision);
+    static bool initMotor(ModbusMaster& master, int motorId);   // 协议=modbus + 细分=16
 
     // —— 电机使能 ——
     static bool setMotorEnable(ModbusMaster& master, int motorId, bool enable);  // 单台使能/失能
@@ -73,7 +78,6 @@ public:
 private:
     static constexpr double DEG2CNT = MOTOR_RESOLUTION / 360.0;
     static inline std::vector<uint8_t> g_cfg_addr = {1, 2, 3};  // 配置里的所有从站地址
-    static inline std::vector<uint8_t> g_addr;                  // 实际在线、要控制的从站地址
     static inline uint64_t g_err[3] = {0, 0, 0};                // 每台累计失败次数（下标 = 地址-1）
     static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
 };

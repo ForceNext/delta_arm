@@ -18,6 +18,30 @@ bool MotorMapping::SetMotorMode(ModbusMaster& master, int motorId, int mode)
     return master.writeRegister((uint8_t)motorId, Cmd::SET_MODE, (uint16_t)mode);
 }
 
+// 设置通信协议（功能码 0x06，寄存器 0x69）：0=自定义 1=modbus 2=canopen
+bool MotorMapping::setProtocol(ModbusMaster& master, int motorId, uint16_t protocol)
+{
+    if (motorId < 1 || motorId > 3) {
+        return false; // 无效的电机ID
+    }
+    return master.writeRegister((uint8_t)motorId, Cmd::SET_PROTOCOL, protocol);
+}
+
+// 设置细分（功能码 0x06，寄存器 0x65）：取值范围 1~256
+bool MotorMapping::setSubdivision(ModbusMaster& master, int motorId, uint16_t subdivision)
+{
+    if (motorId < 1 || motorId > 3) {
+        return false; // 无效的电机ID
+    }
+    return master.writeRegister((uint8_t)motorId, Cmd::SET_SUBDIVISION, subdivision);
+}
+
+// 初始化电机：设置协议为 modbus、细分 16
+bool MotorMapping::initMotor(ModbusMaster& master, int motorId)
+{
+    return setProtocol(master, motorId, 1) && setSubdivision(master, motorId, 16);
+}
+
 // 单台电机使能/失能（功能码 0x06，寄存器 0xFA）：0=使能，1=失能
 bool MotorMapping::setMotorEnable(ModbusMaster& master, int motorId, bool enable)
 {
@@ -110,33 +134,6 @@ void MotorMapping::loadMotorAddrs(const std::string& path)
     } catch (const std::exception& e) {
         std::cerr << "读取电机地址失败(" << e.what() << ")，使用默认 {1,2,3}\n";
     }
-}
-
-// 探测在线电机：逐个读实时位置（0x2A），能应答的才纳入控制列表并标记在线
-void MotorMapping::detectMotors(ModbusMaster& master)
-{
-    g_addr.clear();
-    for (int i = 0; i < 3; ++i) {
-        g_online[i] = false;
-        g_err[i] = 0;
-    }
-
-    for (uint8_t a : g_cfg_addr) {
-        if (probeMotor(master, a)) {
-            g_addr.push_back(a);
-            if (a >= 1 && a <= 3) g_online[a - 1] = true;
-        }
-    }
-    bool fell_back = g_addr.empty();
-    if (fell_back) {
-        std::cerr << "未探测到任何在线电机，退回配置地址\n";
-        g_addr = g_cfg_addr;   // 注：不改 g_online，保持全 false（非实测在线）
-    }
-
-    if (fell_back)
-        std::cout << "使用配置地址 " << g_addr.size() << " 台（非实测在线）\n";
-    else
-        std::cout << "探测到 " << g_addr.size() << " 台在线电机\n";
 }
 
 // 读 0x2A 实时位置判断电机是否在线（有有效应答即在线）
