@@ -39,6 +39,16 @@ private:
     uint64_t cycle_ = 0;                   // 控制循环计数（状态 seq）
     std::string hw_cfg_;                   // 硬件配置文件路径（串口 + 电机地址 + 关节参数）
     Kinematics kin_;                       // delta 正逆解（逆解：末端 xyz → 关节角）
+
+    uint32_t consec_fail_[3] = {0, 0, 0};  // 每台连续失败次数（下标 = 电机号-1）
+    bool emergency_stop_ = false;          // 掉线停机标志
+    uint32_t reprobe_counter_ = 0;         // 周期探测/重探计数
+    bool motors_ready_ = false;            // 所有电机已在线并使能
+    uint8_t prev_online_mask_ = 0;         // 上次打印的在线位掩码（避免刷屏）
+
+    // 发布状态到共享内存（online 反映真实在线状态）
+    void publishStatus(const ArmCommand& cmd, bool reachable,
+                       const uint32_t* counts, const double* fk_xyz);
 };
 
 #endif

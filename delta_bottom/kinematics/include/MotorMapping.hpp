@@ -45,7 +45,13 @@ public:
 
     // 探测结果访问（供控制循环使用）
     static const std::vector<uint8_t>& addrs() { return g_addr; }  // 在线从站地址
-    static std::vector<uint64_t>& errs() { return g_err; }         // 每台累计失败次数
+    static uint64_t (&errs())[3] { return g_err; }                 // 每台累计失败次数（下标 = 地址-1）
+
+    // 运行时在线状态（下标 = 从站地址-1，即电机号-1）
+    static bool isOnline(int motorId) { return g_online[motorId - 1]; }
+    static void setOnline(int motorId, bool on) { g_online[motorId - 1] = on; }
+    static bool probeMotor(ModbusMaster& master, int motorId);   // 读 0x2A 判断是否在线
+    static bool allOnline();                                     // 配置里的所有电机是否都在线
 
     static double motorPosToAngle(double pos);   // 电机计数 → 关节角度（度）
     static double angleToMotorPos(double angle); // 关节角度（度）→ 电机计数
@@ -68,7 +74,8 @@ private:
     static constexpr double DEG2CNT = MOTOR_RESOLUTION / 360.0;
     static inline std::vector<uint8_t> g_cfg_addr = {1, 2, 3};  // 配置里的所有从站地址
     static inline std::vector<uint8_t> g_addr;                  // 实际在线、要控制的从站地址
-    static inline std::vector<uint64_t> g_err;                  // 每台累计失败次数
+    static inline uint64_t g_err[3] = {0, 0, 0};                // 每台累计失败次数（下标 = 地址-1）
+    static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
 };
 
 #endif // MOTOR_MAPPING_HPP

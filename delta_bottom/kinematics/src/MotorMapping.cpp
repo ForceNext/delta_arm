@@ -30,8 +30,9 @@ bool MotorMapping::setMotorEnable(ModbusMaster& master, int motorId, bool enable
 // 使能所有在线电机（启动时调用）
 void MotorMapping::enableMotors(ModbusMaster& master)
 {
-    for (uint8_t a : g_addr)
-        master.writeRegister(a, Cmd::ENABLE, 0x0000);
+    for (int id = 1; id <= 3; ++id)
+        if (g_online[id - 1])
+            master.writeRegister((uint8_t)id, Cmd::ENABLE, 0x0000);
 }
 
 // 发送绝对位置控制命令（功能码 0x10，寄存器 0xF2）：
@@ -111,27 +112,48 @@ void MotorMapping::loadMotorAddrs(const std::string& path)
     }
 }
 
-// 探测在线电机：逐个读实时位置（0x2A），能应答的才纳入控制列表
+// 探测在线电机：逐个读实时位置（0x2A），能应答的才纳入控制列表并标记在线
 void MotorMapping::detectMotors(ModbusMaster& master)
 {
     g_addr.clear();
+    for (int i = 0; i < 3; ++i) {
+        g_online[i] = false;
+        g_err[i] = 0;
+    }
+
     for (uint8_t a : g_cfg_addr) {
-        uint16_t buf[2] = {0, 0};
-        if (master.readInputRegisters(a, Cmd::READ_POS, 2, buf))
+        if (probeMotor(master, a)) {
             g_addr.push_back(a);
+            if (a >= 1 && a <= 3) g_online[a - 1] = true;
+        }
     }
     bool fell_back = g_addr.empty();
     if (fell_back) {
         std::cerr << "未探测到任何在线电机，退回配置地址\n";
-        g_addr = g_cfg_addr;
+        g_addr = g_cfg_addr;   // 注：不改 g_online，保持全 false（非实测在线）
     }
-
-    g_err.assign(g_addr.size(), 0);
 
     if (fell_back)
         std::cout << "使用配置地址 " << g_addr.size() << " 台（非实测在线）\n";
     else
         std::cout << "探测到 " << g_addr.size() << " 台在线电机\n";
+}
+
+// 读 0x2A 实时位置判断电机是否在线（有有效应答即在线）
+bool MotorMapping::probeMotor(ModbusMaster& master, int motorId)
+{
+    uint16_t buf[2] = {0, 0};
+    return master.readInputRegisters((uint8_t)motorId, Cmd::READ_POS, 2, buf);
+}
+
+// 配置里的所有电机是否都已在线
+bool MotorMapping::allOnline()
+{
+    for (uint8_t a : g_cfg_addr) {
+        if (a < 1 || a > 3) return false;   // 地址越界视为不在线
+        if (!g_online[a - 1]) return false;
+    }
+    return !g_cfg_addr.empty();
 }
 
 
