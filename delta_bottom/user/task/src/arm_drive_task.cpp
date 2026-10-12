@@ -4,7 +4,7 @@
 // 运动参数（来自上位机实测）：加减速 200，速度 1000 RPM
 constexpr uint8_t  MOVE_ACCEL = 200;
 constexpr uint16_t MOVE_SPEED = 1000;
-constexpr uint32_t OFFLINE_FAIL_LIMIT = 5;   // 连续失败 5 次判定掉线
+constexpr uint32_t OFFLINE_FAIL_LIMIT = 20;  // 连续失败 20 次判定掉线
 constexpr uint32_t REPROBE_PERIOD    = 200;  // 停机后每 200 拍（≈1s）重探一次
 constexpr uint32_t WAIT_PROBE_PERIOD = 20;   // 等待电机上电时每 20 拍（≈100ms）探测一次
 

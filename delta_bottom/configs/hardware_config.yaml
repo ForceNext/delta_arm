@@ -1,26 +1,29 @@
 serial:
   port: "/dev/ttyACM0"
-  baudrate: 921600
+  baudrate: 115200
 
 motors:
   - addr: 1
     name: "motor_1"
     speed_rpm: 1000
     accel: 200
+    microstep: 16
 
   - addr: 2
     name: "motor_2"
     speed_rpm: 1000
     accel: 200
+    microstep: 16
 
   - addr: 3
     name: "motor_3"
     speed_rpm: 1000
     accel: 200
+    microstep: 16
 
 joint:
   jointlength: #mm
-    - [100,150,250,50] #d1,L1,L2,d2 三个臂参数相同
+    - [115,150,292,40] #d1,L1,L2,d2 三个臂参数相同
   
   gear_ratio:
     - [2.0,2.0,2.0] #三个主动臂传动比

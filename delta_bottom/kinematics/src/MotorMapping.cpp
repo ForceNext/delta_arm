@@ -36,10 +36,13 @@ bool MotorMapping::setSubdivision(ModbusMaster& master, int motorId, uint16_t su
     return master.writeRegister((uint8_t)motorId, Cmd::SET_SUBDIVISION, subdivision);
 }
 
-// 初始化电机：设置协议为 modbus、细分 16
+// 初始化电机：先清除状态（避免残留刹车/堵转状态导致无法运动），再设置协议为 modbus、细分（读自配置）
 bool MotorMapping::initMotor(ModbusMaster& master, int motorId)
 {
-    return setProtocol(master, motorId, 1) && setSubdivision(master, motorId, 16);
+    if (motorId < 1 || motorId > 3) return false;
+    return clearStatus(master, motorId) &&
+           setProtocol(master, motorId, 1) &&
+           setSubdivision(master, motorId, g_microstep[motorId - 1]);
 }
 
 // 单台电机使能/失能（功能码 0x06，寄存器 0xFA）：0=使能，1=失能
@@ -122,14 +125,19 @@ double MotorMapping::angleToMotorPos(double angle)
     return angle * DEG2CNT;
 }
 
-// 从 yaml 读电机候选地址（覆盖默认 {1,2,3}）
+// 从 yaml 读电机候选地址与细分（覆盖默认 {1,2,3} / 16）
 void MotorMapping::loadMotorAddrs(const std::string& path)
 {
     try {
         YAML::Node root = YAML::LoadFile(path);
         std::vector<uint8_t> a;
-        for (const auto& m : root["motors"])
-            a.push_back((uint8_t)m["addr"].as<int>());
+        for (const auto& m : root["motors"]) {
+            uint8_t addr = (uint8_t)m["addr"].as<int>();
+            a.push_back(addr);
+            // 读细分（microstep），有该字段才覆盖；无则保持默认 16
+            if (m["microstep"] && addr >= 1 && addr <= 3)
+                g_microstep[addr - 1] = (uint16_t)m["microstep"].as<int>();
+        }
         if (!a.empty()) g_cfg_addr = a;
     } catch (const std::exception& e) {
         std::cerr << "读取电机地址失败(" << e.what() << ")，使用默认 {1,2,3}\n";

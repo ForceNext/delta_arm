@@ -78,6 +78,7 @@ public:
 private:
     static constexpr double DEG2CNT = MOTOR_RESOLUTION / 360.0;
     static inline std::vector<uint8_t> g_cfg_addr = {1, 2, 3};  // 配置里的所有从站地址
+    static inline uint16_t g_microstep[3] = {16, 16, 16};       // 每台细分（下标 = 地址-1），默认 16
     static inline uint64_t g_err[3] = {0, 0, 0};                // 每台累计失败次数（下标 = 地址-1）
     static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
 };

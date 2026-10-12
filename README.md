@@ -6,7 +6,7 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 
 - **已实现（可运行）**：实时任务框架 `PeriodicTask`（`timerfd` 周期调度 + `SCHED_FIFO` 实时优先级 + CPU 亲和性绑定 + 线程生命周期管理）；串口驱动 `SerialPort`、Modbus 主站 `ModbusMaster`、电机控制封装 `MotorMapping`、delta 正逆解 `Kinematics`、上下位机共享内存 `ArmSharedMemory`，以及机械臂驱动任务 `ArmDriveTask`（在线监测/初始化 → 逆解 → `moveAbsolute` 下发 → 发布状态）。
 - **控制链路已贯通**：主循环已从旧的 `clock_nanosleep` 单线程循环迁移到 `PeriodicTask` 框架。`ArmDriveTask::run()` 在 200 Hz 周期内完成「读 `ArmCommand`（末端坐标）→ 逆解关节角 → ×传动比 → `DEG2CNT` 计数 → 逐台 `moveAbsolute` 下发 → 回写 `ArmStatus`」的端到端链路。
-- **在线监测与初始化**：启动时持续探测 3 台电机，全部上线后逐台初始化（设置协议 `0x69`=modbus、设置细分 `0x65`=16），初始化完成才使能并进入运动控制；运行中连续无应答（默认 5 次）判定掉线，对在线电机执行刹车保持（`0xFC`，不失能）并停机，周期重探等待恢复。
+- **在线监测与初始化**：启动时持续探测 3 台电机，全部上线后逐台初始化（清除状态 `0xFB` → 设置协议 `0x69`=modbus → 设置细分 `0x65`，细分数值读自配置），初始化完成才使能并进入运动控制；运行中连续无应答（默认 20 次）判定掉线，对在线电机执行刹车保持（`0xFC`，不失能）并停机，周期重探等待恢复。
 - **未实现**：电机**零点偏移与转向标定**（当前 `θ=0` 直接对应上臂水平、电机角 = 关节角 × 传动比，尚未纳入各臂零点偏置/反向）；以及读回电机实际位置做正解回发（当前状态回显的是命令关节角正解出的坐标，非实测）。
 
 ## 关键设计
@@ -17,7 +17,7 @@ Delta 并联机械臂项目。当前已实现下位机 `delta_bottom`：在 Linu
 - **驱动器**：正点原子 PDxxS1 闭环步进驱动器，位置分辨率 `51200` = 一圈（360°）
 - **上下位机通信**：POSIX 共享内存（`shm_open` + `mmap`）+ System V 信号量互斥（key `0x5A11`）
 - **在线探测**：读 `0x2A`（实时位置）判断电机在线；启动时持续探测，全部上线才初始化并运动
-- **掉线保护**：运行中连续无应答（默认 5 次）判定掉线，`stopMotor` 刹车保持（不失能），避免末端掉落
+- **掉线保护**：运行中连续无应答（默认 20 次）判定掉线，`stopMotor` 刹车保持（不失能），避免末端掉落
 
 ## 架构与数据流
 
@@ -167,7 +167,7 @@ delta_arm/
 | --- | --- | --- |
 | `loadMotorAddrs()` | 从 yaml 读候选电机地址 | — |
 | `probeMotor()` / `allOnline()` | 读 `0x2A` 探测单台在线 / 判断是否全部在线 | `0x2A` |
-| `initMotor()`（`setProtocol` + `setSubdivision`） | 初始化：设置协议(modbus) + 设置细分(16) | `0x69` + `0x65` |
+| `initMotor()`（`clearStatus` + `setProtocol` + `setSubdivision`） | 初始化：清除状态 + 设置协议(modbus) + 设置细分(读自配置) | `0xFB` + `0x69` + `0x65` |
 | `setMotorEnable()` / `enableMotors()` | 单台 / 全部使能（失能） | `0xFA` |
 | `SetMotorMode()` | 设置工作模式 | `0x62` |
 | `moveAbsolute()` / `moveRelative()` | 绝对 / 相对位置控制 | `0xF2` / `0xF3` |
@@ -311,24 +311,28 @@ motors:                    # 电机（从站）列表
     name: "motor_1"
     speed_rpm: 1000
     accel: 200
+    microstep: 16           # 细分（microstep），初始化时下发
   - addr: 2
     name: "motor_2"
     speed_rpm: 1000
     accel: 200
+    microstep: 16           # 细分（microstep），初始化时下发
   - addr: 3
     name: "motor_3"
     speed_rpm: 1000
     accel: 200
+    microstep: 16           # 细分（microstep），初始化时下发
 
 joint:                     # delta 几何参数
   jointlength:             # mm
-    - [100, 150, 250, 50]  # d1(基座半径), L1(上臂长), L2(前臂长), d2(动平台半径)
+    - [115, 150, 292, 40]  # d1(基座半径), L1(上臂长), L2(前臂长), d2(动平台半径)
   gear_ratio:
     - [2.0, 2.0, 2.0]      # 三个主动臂传动比（电机角 = 关节角 × 传动比）
 ```
 
 - `serial.port` / `serial.baudrate`：串口与波特率。
 - `motors[].addr`：驱动器从站地址；程序启动时持续探测，**等所有配置的电机都上线**才初始化并运动，任一掉线则停机。
+- `motors[].microstep`：细分值，由 `loadMotorAddrs` 读取，初始化时经 `0x65` 下发（默认 16）。
 - `joint.jointlength`：基座半径 `d1`、上臂长 `L1`、前臂长 `L2`、动平台半径 `d2`（mm），由 `Kinematics::fromYaml` 读取用于正逆解。
 - `joint.gear_ratio`：三个主动臂传动比；逆解出的关节角乘它得到电机角。
 - `motors[].name` / `speed_rpm` / `accel` 为预留字段，暂未在控制循环中使用（加减速/速度用 `arm_drive_task.cpp` 里的 `MOVE_ACCEL` / `MOVE_SPEED`）。
