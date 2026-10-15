@@ -36,13 +36,23 @@ bool MotorMapping::setSubdivision(ModbusMaster& master, int motorId, uint16_t su
     return master.writeRegister((uint8_t)motorId, Cmd::SET_SUBDIVISION, subdivision);
 }
 
-// 初始化电机：先清除状态（避免残留刹车/堵转状态导致无法运动），再设置协议为 modbus、细分（读自配置）
+// 初始化电机：清除状态、设置协议都是 best-effort（驱动器已在目标状态时会返回异常，不阻断）；
+// 细分是关键设置，失败才判定初始化失败
 bool MotorMapping::initMotor(ModbusMaster& master, int motorId)
 {
     if (motorId < 1 || motorId > 3) return false;
-    return clearStatus(master, motorId) &&
-           setProtocol(master, motorId, 1) &&
-           setSubdivision(master, motorId, g_microstep[motorId - 1]);
+
+    clearStatus(master, motorId);   // best-effort：无故障时可能返回异常
+
+    // 协议已是 modbus（探测 0x2A 能通即证明），重复设置可能返回异常，忽略
+    if (!setProtocol(master, motorId, 1))
+        std::cerr << "[Init] 电机 " << motorId << " 设置协议失败（忽略，已是 modbus）\n";
+
+    if (!setSubdivision(master, motorId, g_microstep[motorId - 1])) {
+        std::cerr << "[Init] 电机 " << motorId << " 设置细分失败\n";
+        return false;
+    }
+    return true;
 }
 
 // 单台电机使能/失能（功能码 0x06，寄存器 0xFA）：0=使能，1=失能

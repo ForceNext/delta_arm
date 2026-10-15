@@ -1,5 +1,51 @@
 #include "serial_port.hpp"
 #include <chrono>
+#include <sys/ioctl.h>
+
+// —— 任意波特率支持（256000 等非标值）——
+// glibc 的 termios 接口只有标准 Bxxx 常量；内核的 termios2 + BOTHER 支持任意波特率。
+// 这里手动声明 struct termios2（布局与内核 <asm-generic/termbits.h> 一致，44 字节），
+// 避免包含 <asm/termbits.h> 与 <termios.h> 的 struct termios 重定义冲突。
+#ifndef BOTHER
+#define BOTHER 0x1000   // CBAUDEX：非标波特率标志
+#endif
+#ifndef CBAUD
+#define CBAUD 0x100F    // 标准波特率掩码
+#endif
+
+struct termios2 {
+    tcflag_t c_iflag;    // 输入模式标志
+    tcflag_t c_oflag;    // 输出模式标志
+    tcflag_t c_cflag;    // 控制模式标志
+    tcflag_t c_lflag;    // 本地模式标志
+    cc_t     c_line;     // 行规程
+    cc_t     c_cc[19];   // 控制字符（NCCS）
+    speed_t  c_ispeed;   // 输入波特率
+    speed_t  c_ospeed;   // 输出波特率
+};
+#define TCGETS2 _IOR('T', 0x2A, struct termios2)
+#define TCSETS2 _IOW('T', 0x2B, struct termios2)
+
+namespace {
+// 用 termios2 + BOTHER 设置任意波特率（Linux 无 B256000 常量，故走此路径）
+bool setArbitraryBaud(int fd, int baudrate)
+{
+    struct termios2 tio;
+    if (ioctl(fd, TCGETS2, &tio) != 0) {
+        std::cerr << "TCGETS2 失败: " << strerror(errno) << "\n";
+        return false;
+    }
+    tio.c_cflag &= ~CBAUD;
+    tio.c_cflag |= BOTHER;
+    tio.c_ispeed = baudrate;
+    tio.c_ospeed = baudrate;
+    if (ioctl(fd, TCSETS2, &tio) != 0) {
+        std::cerr << "TCSETS2 失败: " << strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+}
+}  // namespace
 
 SerialPort::~SerialPort() { close(); }
 
@@ -76,7 +122,7 @@ int SerialPort::baudrateToSpeed(int baudrate)
         case 1500000: return B1500000;
         case 2000000: return B2000000;
         default:
-            std::cerr << "不支持的波特率: " << baudrate << "\n";
+            // 非标准波特率（如 256000），返回 -1，由 setInterfaceAttrs 走 termios2 路径
             return -1;
     }
 }
@@ -91,7 +137,8 @@ bool SerialPort::setInterfaceAttrs(int baudrate)
     }
 
     int speed = baudrateToSpeed(baudrate);
-    if (speed < 0) return false;
+    bool arbitrary = (speed < 0);   // 非标准波特率，稍后用 termios2 设置
+    if (arbitrary) speed = B9600;   // 先占位，保证 tcsetattr 成功
 
     cfsetospeed(&tty, speed);
     cfsetispeed(&tty, speed);
@@ -124,6 +171,9 @@ bool SerialPort::setInterfaceAttrs(int baudrate)
         std::cerr << "tcsetattr 失败: " << strerror(errno) << "\n";
         return false;
     }
+
+    if (arbitrary)
+        return setArbitraryBaud(fd_, baudrate);
     return true;
 }
 
