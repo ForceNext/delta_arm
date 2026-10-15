@@ -51,6 +51,7 @@ public:
     static bool isOnline(int motorId) { return g_online[motorId - 1]; }
     static void setOnline(int motorId, bool on) { g_online[motorId - 1] = on; }
     static bool probeMotor(ModbusMaster& master, int motorId);   // 读 0x2A 判断是否在线
+    static int probeMotorRc(ModbusMaster& master, int motorId);  // 同上，返回失败原因（0=在线）
     static bool allOnline();                                     // 配置里的所有电机是否都在线
 
     static double motorPosToAngle(double pos);   // 电机计数 → 关节角度（度）
@@ -70,6 +71,9 @@ public:
     // —— 运动控制 ——
     static bool moveAbsolute(ModbusMaster& master, int motorId, uint32_t position,
                              uint8_t direction = 0, uint8_t accel = 200, uint16_t speed = 1000);
+    // 同上，返回失败原因（0=成功；-1 超时 / -2 地址功能码错 / -3 CRC 错 / >0 从站异常码）
+    static int moveAbsoluteRc(ModbusMaster& master, int motorId, uint32_t position,
+                              uint8_t direction = 0, uint8_t accel = 200, uint16_t speed = 1000);
     static bool moveRelative(ModbusMaster& master, int motorId, uint32_t offset,
                              uint8_t direction = 0, uint8_t accel = 200, uint16_t speed = 1000);
     static bool stopMotor(ModbusMaster& master, int motorId);    // 立即停止（刹车）

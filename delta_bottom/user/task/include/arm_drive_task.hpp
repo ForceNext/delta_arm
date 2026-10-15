@@ -46,6 +46,12 @@ private:
     bool motors_ready_ = false;            // 所有电机已在线并使能
     uint8_t prev_online_mask_ = 0;         // 上次打印的在线位掩码（避免刷屏）
 
+    int next_motor_ = 1;                   // 轮转下发游标（1~3）：每拍只更新一台
+    int wait_probe_addr_ = 1;              // 等待上电阶段轮转探测的地址（1~3）
+    int last_rc_[3] = {0, 0, 0};           // 每台上次失败原因（仅原因变化时打印，避免刷屏）
+    uint64_t nontimeout_err_[3] = {0, 0, 0}; // 每台非超时失败累计（-2 地址/功能码、-3 CRC、>0 异常码）
+    uint32_t mb_errcnt_ = 0;               // 统计窗口内非超时事务失败次数
+
     // 发布状态到共享内存（online 反映真实在线状态）
     void publishStatus(const ArmCommand& cmd, bool reachable,
                        const uint32_t* counts, const double* fk_xyz);

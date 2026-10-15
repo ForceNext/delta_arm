@@ -4,9 +4,13 @@
 // 运动参数（来自上位机实测）：加减速 200，速度 1000 RPM
 constexpr uint8_t  MOVE_ACCEL = 200;
 constexpr uint16_t MOVE_SPEED = 1000;
-constexpr uint32_t OFFLINE_FAIL_LIMIT = 20;  // 连续失败 20 次判定掉线
+constexpr uint32_t OFFLINE_FAIL_LIMIT = 20;  // 连续【超时】20 次判定掉线
 constexpr uint32_t REPROBE_PERIOD    = 200;  // 停机后每 200 拍（≈1s）重探一次
 constexpr uint32_t WAIT_PROBE_PERIOD = 20;   // 等待电机上电时每 20 拍（≈100ms）探测一次
+
+// 手册 5.4.13：0xFC 刹停后需及时 0xFB 清状态，否则电机可能严重发烫。
+// 清状态只清"堵转/刹车/失能"标志位，电机仍保持使能与位置闭环。
+constexpr bool CLEAR_STATUS_AFTER_BRAKE = true;
 
 ArmDriveTask::ArmDriveTask(PeriodicTaskManager* taskManager, float period, std::string name,
                            int argc, char** argv)
@@ -16,7 +20,12 @@ ArmDriveTask::ArmDriveTask(PeriodicTaskManager* taskManager, float period, std::
       hw_cfg_((argc > 1) ? argv[1] : "configs/hardware_config.yaml"),
       kin_(Kinematics::fromYaml(hw_cfg_))
 {
-    master_.resp_timeout_ms = 20;
+    master_.resp_timeout_ms = 20;   // 等应答首字节
+    // 帧内字节间隔：驱动器在电机运动/忙碌时回帧可能被拆成两段，
+    // 5ms 会把中间的正常停顿误判成超时，放宽到 12ms。
+    master_.byte_timeout_ms = 12;
+    // 发帧前要求总线静默 1ms：轮转下发后每拍只有 1 次事务，这点开销可承受
+    master_.idle_gap_ms = 1;
 
     int latency_target_fd = open("/dev/cpu_dma_latency", O_RDWR);
     if (latency_target_fd == -1) {
@@ -68,11 +77,18 @@ void ArmDriveTask::init()
     time_ctrl.start();
 
     // 复位掉线停机 / 等待上电状态
-    for (int i = 0; i < 3; ++i) consec_fail_[i] = 0;
+    for (int i = 0; i < 3; ++i) {
+        consec_fail_[i] = 0;
+        last_rc_[i] = 0;
+        nontimeout_err_[i] = 0;
+    }
     emergency_stop_ = false;
     reprobe_counter_ = 0;
     motors_ready_ = false;
     prev_online_mask_ = 0;
+    next_motor_ = 1;
+    wait_probe_addr_ = 1;
+    mb_errcnt_ = 0;
 
     shm_.connect();  // 连接共享内存：首次创建，其余附加
 
@@ -93,20 +109,32 @@ void ArmDriveTask::run()
     if (!motors_ready_) {
         if (++reprobe_counter_ >= WAIT_PROBE_PERIOD) {
             reprobe_counter_ = 0;
-            for (int id = 1; id <= 3; ++id) {
-                if (MotorMapping::probeMotor(master_, id)) {
-                    MotorMapping::setOnline(id, true);
-                    consec_fail_[id - 1] = 0;
-                } else {
-                    // 多次无返回才判定不在线（避免单次干扰）
-                    if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT)
-                        MotorMapping::setOnline(id, false);
+            // 每轮只探一台（1→2→3 轮转）：不存在的地址每次要等满 20ms 超时，
+            // 一轮探三台会把 200Hz 循环堵住 60ms，是周期掉到 180Hz 的主因。
+            int id = wait_probe_addr_;
+            wait_probe_addr_ = (wait_probe_addr_ % 3) + 1;
+            int rc = MotorMapping::probeMotorRc(master_, id);
+            if (rc == MB_RC_OK) {
+                MotorMapping::setOnline(id, true);
+                consec_fail_[id - 1] = 0;
+                last_rc_[id - 1] = 0;
+            } else if (rc == MB_RC_TIMEOUT) {
+                // 只有"完全无应答"才计入离线判定（避免偶发帧错让电机来回上下线）
+                if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT)
+                    MotorMapping::setOnline(id, false);
+            } else {
+                // CRC 错 / 地址功能码错 / 从站异常码：只统计并打印原因，不判离线
+                ++nontimeout_err_[id - 1];
+                if (last_rc_[id - 1] != rc) {
+                    last_rc_[id - 1] = rc;
+                    printf_color(PrintColor::Yellow,
+                        "[DriveTask] 电机 %d 探测异常：%s\n", id, modbusRcName(rc));
                 }
             }
 
             uint8_t mask = 0;
-            for (int id = 1; id <= 3; ++id)
-                if (MotorMapping::isOnline(id)) mask |= (uint8_t)(1u << (id - 1));
+            for (int i = 1; i <= 3; ++i)
+                if (MotorMapping::isOnline(i)) mask |= (uint8_t)(1u << (i - 1));
             if (mask != prev_online_mask_) {
                 prev_online_mask_ = mask;
                 printf_color(PrintColor::Yellow,
@@ -115,18 +143,19 @@ void ArmDriveTask::run()
             }
 
             if (MotorMapping::allOnline()) {
-                // 初始化：设置协议(modbus) + 设置细分(16)，全部成功才使能
+                // 初始化：设置协议(modbus) + 设置细分，全部成功才使能
                 bool all_init_ok = true;
-                for (int id = 1; id <= 3; ++id) {
-                    if (!MotorMapping::initMotor(master_, id)) {
+                for (int i = 1; i <= 3; ++i) {
+                    if (!MotorMapping::initMotor(master_, i)) {
                         all_init_ok = false;
                         printf_color(PrintColor::Red,
-                            "[DriveTask] 电机 %d 初始化失败，下拍重试\n", id);
+                            "[DriveTask] 电机 %d 初始化失败，下拍重试\n", i);
                     }
                 }
                 if (all_init_ok) {
                     MotorMapping::enableMotors(master_);
                     motors_ready_ = true;
+                    next_motor_ = 1;
                     printf_color(PrintColor::Green,
                         "[DriveTask] 全部在线并初始化完成，已使能，开始运行\n");
                 }
@@ -141,11 +170,29 @@ void ArmDriveTask::run()
     if (emergency_stop_) {
         if (++reprobe_counter_ >= REPROBE_PERIOD) {
             reprobe_counter_ = 0;
-            for (int id = 1; id <= 3; ++id) {
+            // 同样每轮只探一台（轮转），避免 3×20ms 超时把循环堵住
+            for (int k = 0; k < 3; ++k) {
+                int id = wait_probe_addr_;
+                wait_probe_addr_ = (wait_probe_addr_ % 3) + 1;
                 if (MotorMapping::isOnline(id)) continue;
-                if (MotorMapping::probeMotor(master_, id))
-                    printf_color(PrintColor::Yellow,
-                        "[DriveTask] 电机 %d 已恢复通信，请重启程序恢复运行\n", id);
+                int rc = MotorMapping::probeMotorRc(master_, id);
+                if (rc == MB_RC_OK) {
+                    if (last_rc_[id - 1] != 0) {   // 只在"首次恢复"时提示，避免每秒刷屏
+                        last_rc_[id - 1] = 0;
+                        printf_color(PrintColor::Yellow,
+                            "[DriveTask] 电机 %d 已恢复通信，请重启程序恢复运行\n", id);
+                    }
+                } else if (rc == MB_RC_TIMEOUT) {
+                    MotorMapping::setOnline(id, false);   // 仍无应答
+                } else {
+                    ++nontimeout_err_[id - 1];
+                    if (last_rc_[id - 1] != rc) {
+                        last_rc_[id - 1] = rc;
+                        printf_color(PrintColor::Yellow,
+                            "[DriveTask] 电机 %d 探测异常：%s\n", id, modbusRcName(rc));
+                    }
+                }
+                break;   // 本轮只探这一台
             }
         }
         publishStatus(cmd, false, nullptr, fk_xyz);
@@ -166,42 +213,62 @@ void ArmDriveTask::run()
 
     auto& g_err = MotorMapping::errs();
 
-    // 逐台下发（按电机号 1/2/3），跳过离线电机，并统计连续失败
+    // 逐台下发改为【轮转下发】：每拍只更新一台，3 拍覆盖三台（≈66.7Hz/台）。
+    // 驱动器单次事务约 1~2.6ms（其中线路只占 0.35ms，其余是驱动器响应延迟），
+    // 三台串行 = 5~8ms > 5ms 周期，必然掉频并诱发帧错；改为每拍一台后可稳在 200Hz。
     if (cmd.mode == 1 && reachable) {
-        for (int id = 1; id <= 3; ++id) {
-            if (!MotorMapping::isOnline(id)) continue;
+        for (int k = 0; k < 3; ++k) {
+            int id = next_motor_;
+            next_motor_ = (next_motor_ % 3) + 1;
+            if (!MotorMapping::isOnline(id)) continue;   // 离线则顺延到下一台
 
             modbus_timer_.start();
-            bool ok = MotorMapping::moveAbsolute(master_, id, counts[id - 1],
-                                                 0, MOVE_ACCEL, MOVE_SPEED);
+            int rc = MotorMapping::moveAbsoluteRc(master_, id, counts[id - 1],
+                                                  0, MOVE_ACCEL, MOVE_SPEED);
             double t_ms = modbus_timer_.getMs();
             mb_sum_ms_ += t_ms;
             if (t_ms > mb_max_ms_) mb_max_ms_ = t_ms;
             ++mb_count_;
 
-            if (!ok) {
+            if (rc != MB_RC_OK) {
                 ++g_err[id - 1];
-                if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT) {
-                    MotorMapping::setOnline(id, false);
+                if (last_rc_[id - 1] != rc) {          // 只有原因变化才打印，避免刷屏
+                    last_rc_[id - 1] = rc;
                     printf_color(PrintColor::Red,
-                        "[DriveTask] 电机 %d 连续失败 %u 次，判定掉线，停机！\n",
-                        id, OFFLINE_FAIL_LIMIT);
-                    emergency_stop_ = true;
-                    break;
+                        "[DriveTask] 电机 %d 下发失败：%s\n", id, modbusRcName(rc));
+                }
+                if (rc == MB_RC_TIMEOUT) {
+                    // 仅"完全无应答"计入掉线；CRC 错/地址错/从站异常只统计，不误判掉线
+                    if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT) {
+                        MotorMapping::setOnline(id, false);
+                        printf_color(PrintColor::Red,
+                            "[DriveTask] 电机 %d 连续无应答 %u 次，判定掉线，停机！\n",
+                            id, OFFLINE_FAIL_LIMIT);
+                        emergency_stop_ = true;
+                    }
+                } else {
+                    ++nontimeout_err_[id - 1];
+                    ++mb_errcnt_;
                 }
             } else {
                 consec_fail_[id - 1] = 0;
+                last_rc_[id - 1] = 0;
             }
+            break;   // 本拍只发这一台
         }
     }
 
-    // 若刚触发停机：对仍在线电机刹车保持（不失能，避免末端掉落）
+    // 若刚触发停机：对仍在线电机刹车保持（不失能，避免末端掉落），并清除刹车/故障状态
     if (emergency_stop_) {
-        for (int id = 1; id <= 3; ++id)
-            if (MotorMapping::isOnline(id))
-                MotorMapping::stopMotor(master_, id);
+        for (int id = 1; id <= 3; ++id) {
+            if (!MotorMapping::isOnline(id)) continue;
+            MotorMapping::stopMotor(master_, id);
+            if (CLEAR_STATUS_AFTER_BRAKE)
+                MotorMapping::clearStatus(master_, id);   // 手册要求，避免驱动发热/停在故障态
+        }
         printf_color(PrintColor::Red,
-            "[DriveTask] 已对在线电机执行刹车保持（不失能）\n");
+            "[DriveTask] 已对在线电机执行刹车保持（不失能）%s\n",
+            CLEAR_STATUS_AFTER_BRAKE ? "并清除刹车/故障状态（0xFB）" : "");
     }
 
     publishStatus(cmd, reachable, counts, fk_xyz);
@@ -212,8 +279,8 @@ void ArmDriveTask::run()
     if (++mb_loops_ >= 1000) {
         if (mb_count_ > 0) {
             printf_color(PrintColor::Yellow,
-                "[Modbus] 1000 loops: %u 次事务 | 平均 %.3f ms/次 | 最大 %.3f ms/次 | 每拍合计 %.3f ms\n",
-                mb_count_, mb_sum_ms_ / mb_count_, mb_max_ms_, mb_sum_ms_ / 1000.0);
+                "[Modbus] 1000 loops: %u 次事务 | 平均 %.3f ms/次 | 最大 %.3f ms/次 | 每拍合计 %.3f ms | 非超时错误 %u\n",
+                mb_count_, mb_sum_ms_ / mb_count_, mb_max_ms_, mb_sum_ms_ / 1000.0, mb_errcnt_);
         } else {
             printf_color(PrintColor::Yellow,
                 "[Modbus] 1000 loops: 0 次事务（无电机或 mode!=1）\n");
@@ -221,6 +288,7 @@ void ArmDriveTask::run()
         mb_sum_ms_ = 0.0;
         mb_max_ms_ = 0.0;
         mb_count_ = 0;
+        mb_errcnt_ = 0;
         mb_loops_ = 0;
     }
 }

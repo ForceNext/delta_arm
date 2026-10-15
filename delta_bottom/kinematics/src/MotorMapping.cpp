@@ -78,15 +78,22 @@ void MotorMapping::enableMotors(ModbusMaster& master)
 bool MotorMapping::moveAbsolute(ModbusMaster& master, int motorId, uint32_t position,
                                 uint8_t direction, uint8_t accel, uint16_t speed)
 {
+    return moveAbsoluteRc(master, motorId, position, direction, accel, speed) == MB_RC_OK;
+}
+
+// 同上，但把「为什么失败」透出来（0=成功；-1 超时 / -2 地址功能码错 / -3 CRC 错 / >0 从站异常码）
+int MotorMapping::moveAbsoluteRc(ModbusMaster& master, int motorId, uint32_t position,
+                                 uint8_t direction, uint8_t accel, uint16_t speed)
+{
     if (motorId < 1 || motorId > 3) {
-        return false; // 无效的电机ID
+        return MB_RC_BADADDR; // 无效的电机ID
     }
     uint16_t regs[4];
     regs[0] = (uint16_t)((direction << 8) | accel);  // 方向 | 加减速
     regs[1] = speed;                                 // 速度 RPM
     regs[2] = (uint16_t)(position >> 16);            // 位置高 16 位
     regs[3] = (uint16_t)(position & 0xFFFF);         // 位置低 16 位
-    return master.writeRegisters((uint8_t)motorId, Cmd::ABS_POS, 4, regs);
+    return master.writeRegistersRc((uint8_t)motorId, Cmd::ABS_POS, 4, regs);
 }
 
 // 发送相对位置控制命令（功能码 0x10，寄存器 0xF3）：结构与绝对位置相同，位置为相对偏移
@@ -157,8 +164,14 @@ void MotorMapping::loadMotorAddrs(const std::string& path)
 // 读 0x2A 实时位置判断电机是否在线（有有效应答即在线）
 bool MotorMapping::probeMotor(ModbusMaster& master, int motorId)
 {
+    return probeMotorRc(master, motorId) == MB_RC_OK;
+}
+
+// 同上，返回失败原因（0=在线；-1 无应答超时 / -2 地址功能码错 / -3 CRC 错 / >0 从站异常码）
+int MotorMapping::probeMotorRc(ModbusMaster& master, int motorId)
+{
     uint16_t buf[2] = {0, 0};
-    return master.readInputRegisters((uint8_t)motorId, Cmd::READ_POS, 2, buf);
+    return master.readInputRegistersRc((uint8_t)motorId, Cmd::READ_POS, 2, buf);
 }
 
 // 配置里的所有电机是否都已在线

@@ -42,5 +42,11 @@ public:
 
     // 清空接收缓冲（每次发帧前调用，防止残留字节导致帧错位）
     void flushInput();
+
+    // 等总线静默：丢弃收到的字节，直到连续 quiet_ms 内没有新数据为止。
+    // 用于 RS485 帧间间隔——上一帧的尾巴、迟到或多余的应答若不清掉，
+    // 会被下一次事务当成"自己的应答"，造成地址/CRC 不匹配并连锁污染后续帧。
+    // 返回 true = 已静默；false = 在 max_ms 内始终有数据（超时放弃）。
+    bool waitIdle(int quiet_ms = 1, int max_ms = 20);
     bool Get_SerialOpened(){return serial_opened_;}
 };

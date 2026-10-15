@@ -321,4 +321,34 @@ void SerialPort::flushInput()
     if (fd_ >= 0) tcflush(fd_, TCIFLUSH);
 }
 
+// 等总线静默：抛掉收到的字节，直到连续 quiet_ms 内无新数据
+bool SerialPort::waitIdle(int quiet_ms, int max_ms)
+{
+    if (fd_ < 0) return false;
+    if (quiet_ms < 1) quiet_ms = 1;
+
+    uint8_t junk[256];
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        if (el >= max_ms) return false;   // 总等待超限，放弃（不阻塞实时循环）
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd_, &rfds);
+        struct timeval tv{quiet_ms / 1000, (quiet_ms % 1000) * 1000};
+
+        int ret = select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (ret == 0) return true;        // 连续 quiet_ms 无数据 → 总线已静默
+
+        ssize_t n = ::read(fd_, junk, sizeof(junk));   // 丢弃残余字节
+        if (n < 0 && errno != EINTR && errno != EAGAIN) return false;
+    }
+}
+
 
