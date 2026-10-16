@@ -95,12 +95,29 @@ bool Kinematics::kinematics_ik(double x, double y, double z)
  */
 bool Kinematics::kinematics_fk(double xyz[3]) const
 {
+    return fkFromAngles(theta_, xyz);      // 用命令关节角
+}
+
+/**
+ * @brief 正解（用给定的三个关节角，不改动内部 theta_）
+ * @param joint_theta 三个关节角（度），顺序与臂方位角 0°/120°/240° 对应
+ * @param xyz 出参：末端坐标 [x, y, z]（mm，z 正方向向上）
+ * @return 成功返回 true；三球无交或退化返回 false
+ * @note 供"读回电机实测位置 → ÷减速比 → 实测关节角 → 正解"链路使用
+ */
+bool Kinematics::kinematics_fk(const double joint_theta[3], double xyz[3]) const
+{
+    return fkFromAngles(joint_theta, xyz);
+}
+
+bool Kinematics::fkFromAngles(const double joint_theta[3], double xyz[3]) const
+{
     // 由三个关节角求三个肘点，把动平台半径折入后得到三个虚拟球心 E'_i，
     // 末端中心 O 到 E'_i 的距离恒为 L2_，三球求交。
     double P[3][3];
     for (int i = 0; i < 3; ++i) {
         double phi = i * 120.0 * DEG2RAD;
-        double th  = theta_[i] * DEG2RAD;            // theta_ 单位是度
+        double th  = joint_theta[i] * DEG2RAD;       // 入参单位是度
         double rr  = (d1_ - d2_) + L1_ * std::cos(th);
         P[i][0] = rr * std::cos(phi);
         P[i][1] = rr * std::sin(phi);

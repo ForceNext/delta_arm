@@ -54,8 +54,20 @@ public:
     static int probeMotorRc(ModbusMaster& master, int motorId);  // 同上，返回失败原因（0=在线）
     static bool allOnline();                                     // 配置里的所有电机是否都在线
 
-    static double motorPosToAngle(double pos);   // 电机计数 → 关节角度（度）
-    static double angleToMotorPos(double angle); // 关节角度（度）→ 电机计数
+    // 读实测位置（0x2A，int32 计数）：rc=0 时写入 pos；
+    // 注意拿到的是【电机计数】，要得到关节角还需 motorPosToJointAngle() ÷减速比
+    static int readMotorPosRc(ModbusMaster& master, int motorId, int32_t& pos);
+
+    // —— 角度 ↔ 计数换算 ——
+    // 注意：这里的"角度"指【电机角】（度），不含减速比。
+    static double motorPosToAngle(double pos);   // 电机计数 → 电机角（度）
+    static double angleToMotorPos(double angle); // 电机角（度）→ 电机计数
+
+    // 关节角 ↔ 计数（含减速比），下发/回读两个方向：
+    //   下发：计数     = 关节角(度) × 减速比 × (51200/360)
+    //   回读：关节角   = 计数 ÷ (51200/360) ÷ 减速比
+    static double jointAngleToMotorPos(double joint_angle, double gear_ratio);
+    static double motorPosToJointAngle(double pos, double gear_ratio);
 
     static bool SetMotorMode(ModbusMaster& master, int motorId, int mode);
 

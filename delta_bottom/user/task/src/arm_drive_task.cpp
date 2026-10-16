@@ -24,7 +24,7 @@ ArmDriveTask::ArmDriveTask(PeriodicTaskManager* taskManager, float period, std::
     // 帧内字节间隔：驱动器在电机运动/忙碌时回帧可能被拆成两段，
     // 5ms 会把中间的正常停顿误判成超时，放宽到 12ms。
     master_.byte_timeout_ms = 12;
-    // 发帧前要求总线静默 1ms：轮转下发后每拍只有 1 次事务，这点开销可承受
+    // 发帧前要求总线静默 1ms：6 拍循环里每拍只有 1 次事务，这点开销可承受
     master_.idle_gap_ms = 1;
 
     int latency_target_fd = open("/dev/cpu_dma_latency", O_RDWR);
@@ -81,6 +81,9 @@ void ArmDriveTask::init()
         consec_fail_[i] = 0;
         last_rc_[i] = 0;
         nontimeout_err_[i] = 0;
+        actual_pos_[i] = 0;
+        actual_joint_[i] = 0.0;
+        actual_valid_[i] = false;
     }
     emergency_stop_ = false;
     reprobe_counter_ = 0;
@@ -89,6 +92,11 @@ void ArmDriveTask::init()
     next_motor_ = 1;
     wait_probe_addr_ = 1;
     mb_errcnt_ = 0;
+    mb_disp_ = 0;
+    mb_read_ = 0;
+    cycle_step_ = 0;
+    actual_pose_valid_ = false;
+    actual_xyz_[0] = actual_xyz_[1] = actual_xyz_[2] = 0.0;
 
     shm_.connect();  // 连接共享内存：首次创建，其余附加
 
@@ -201,61 +209,76 @@ void ArmDriveTask::run()
     }
 
     // ===== 正常控制 =====
-    // 逆解：末端坐标 → 关节角 → ×传动比 → 计数；再正解回显
+    // 下发方向：计数 = 关节角 × 减速比 × (51200/360)（jointAngleToMotorPos）
+    // 回读方向：关节角 = 计数 ÷ (51200/360) ÷ 减速比（motorPosToJointAngle）
     uint32_t counts[3] = {0, 0, 0};
     bool reachable = kin_.kinematics_ik(cmd.x, cmd.y, cmd.z);
     if (reachable) {
         for (int i = 0; i < 3; ++i)
             counts[i] = (uint32_t)std::llround(
-                MotorMapping::angleToMotorPos(kin_.motorTheta(i)));
+                MotorMapping::jointAngleToMotorPos(kin_.theta(i), kin_.gearRatio(i)));
         kin_.kinematics_fk(fk_xyz);
     }
 
-    auto& g_err = MotorMapping::errs();
-
-    // 逐台下发改为【轮转下发】：每拍只更新一台，3 拍覆盖三台（≈66.7Hz/台）。
-    // 驱动器单次事务约 1~2.6ms（其中线路只占 0.35ms，其余是驱动器响应延迟），
-    // 三台串行 = 5~8ms > 5ms 周期，必然掉频并诱发帧错；改为每拍一台后可稳在 200Hz。
+    // ===== 正常控制：6 拍一轮，下发与回读交错 =====
+    // 拍号 0 发M1 | 1 读M1 | 2 发M2 | 3 读M2 | 4 发M3 | 5 读M3(→三台实测角齐 → 正解)
+    // 每拍只做 1 次 Modbus 事务（下发约 3.2ms / 回读约 2.9ms），都能装进 4ms 周期；
+    // 一轮 6 拍 = 24ms，每台下发与回读各约 41.7Hz。
     if (cmd.mode == 1 && reachable) {
-        for (int k = 0; k < 3; ++k) {
-            int id = next_motor_;
-            next_motor_ = (next_motor_ % 3) + 1;
-            if (!MotorMapping::isOnline(id)) continue;   // 离线则顺延到下一台
+        const int id = cycle_step_ / 2 + 1;              // 1..3
+        const bool is_read = (cycle_step_ % 2) == 1;
 
-            modbus_timer_.start();
-            int rc = MotorMapping::moveAbsoluteRc(master_, id, counts[id - 1],
-                                                  0, MOVE_ACCEL, MOVE_SPEED);
-            double t_ms = modbus_timer_.getMs();
-            mb_sum_ms_ += t_ms;
-            if (t_ms > mb_max_ms_) mb_max_ms_ = t_ms;
-            ++mb_count_;
+        if (!is_read) {
+            // ---------- 下发 ----------
+            if (MotorMapping::isOnline(id)) {
+                modbus_timer_.start();
+                int rc = MotorMapping::moveAbsoluteRc(master_, id, counts[id - 1],
+                                                      0, MOVE_ACCEL, MOVE_SPEED);
+                double t_ms = modbus_timer_.getMs();
+                mb_sum_ms_ += t_ms;
+                if (t_ms > mb_max_ms_) mb_max_ms_ = t_ms;
+                ++mb_count_; ++mb_disp_;
 
-            if (rc != MB_RC_OK) {
-                ++g_err[id - 1];
-                if (last_rc_[id - 1] != rc) {          // 只有原因变化才打印，避免刷屏
-                    last_rc_[id - 1] = rc;
-                    printf_color(PrintColor::Red,
-                        "[DriveTask] 电机 %d 下发失败：%s\n", id, modbusRcName(rc));
-                }
-                if (rc == MB_RC_TIMEOUT) {
-                    // 仅"完全无应答"计入掉线；CRC 错/地址错/从站异常只统计，不误判掉线
-                    if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT) {
-                        MotorMapping::setOnline(id, false);
-                        printf_color(PrintColor::Red,
-                            "[DriveTask] 电机 %d 连续无应答 %u 次，判定掉线，停机！\n",
-                            id, OFFLINE_FAIL_LIMIT);
-                        emergency_stop_ = true;
-                    }
+                if (rc != MB_RC_OK) {
+                    handleTxFailure(id, rc, "下发");
                 } else {
-                    ++nontimeout_err_[id - 1];
-                    ++mb_errcnt_;
+                    consec_fail_[id - 1] = 0;
+                    last_rc_[id - 1] = 0;
                 }
-            } else {
-                consec_fail_[id - 1] = 0;
-                last_rc_[id - 1] = 0;
             }
-            break;   // 本拍只发这一台
+        } else {
+            // ---------- 回读实测位置 ----------
+            if (MotorMapping::isOnline(id)) {
+                int32_t pos = 0;
+                modbus_timer_.start();
+                int rc = MotorMapping::readMotorPosRc(master_, id, pos);
+                double t_ms = modbus_timer_.getMs();
+                mb_sum_ms_ += t_ms;
+                if (t_ms > mb_max_ms_) mb_max_ms_ = t_ms;
+                ++mb_count_; ++mb_read_;
+
+                if (rc != MB_RC_OK) {
+                    handleTxFailure(id, rc, "回读");
+                } else {
+                    consec_fail_[id - 1] = 0;
+                    last_rc_[id - 1] = 0;
+                    actual_pos_[id - 1] = pos;
+                    // 计数 → 关节角：÷(51200/360) 再 ÷减速比
+                    actual_joint_[id - 1] =
+                        MotorMapping::motorPosToJointAngle((double)pos, kin_.gearRatio(id - 1));
+                    actual_valid_[id - 1] = true;
+
+                    // 三台实测角齐了 → 用实测关节角做正解，得到真实末端坐标
+                    if (actual_valid_[0] && actual_valid_[1] && actual_valid_[2]) {
+                        if (kin_.kinematics_fk(actual_joint_, actual_xyz_))
+                            actual_pose_valid_ = true;
+                    }
+                }
+            }
         }
+        cycle_step_ = (cycle_step_ + 1) % 6;
+    } else {
+        cycle_step_ = 0;       // 空闲或逆解不可达：本轮作废，恢复命令时从"发M1"重新开始
     }
 
     // 若刚触发停机：对仍在线电机刹车保持（不失能，避免末端掉落），并清除刹车/故障状态
@@ -275,12 +298,13 @@ void ArmDriveTask::run()
 
     ++cycle_;
 
-    // 周期性打印 Modbus 事务耗时统计（每 1000 拍 ≈ 5 s）
+    // 周期性打印 Modbus 事务耗时统计（每 1000 拍 ≈ 4 s）
     if (++mb_loops_ >= 1000) {
         if (mb_count_ > 0) {
             printf_color(PrintColor::Yellow,
-                "[Modbus] 1000 loops: %u 次事务 | 平均 %.3f ms/次 | 最大 %.3f ms/次 | 每拍合计 %.3f ms | 非超时错误 %u\n",
-                mb_count_, mb_sum_ms_ / mb_count_, mb_max_ms_, mb_sum_ms_ / 1000.0, mb_errcnt_);
+                "[Modbus] 1000 loops: %u 次事务（下发 %u / 回读 %u）| 平均 %.3f ms/次 | 最大 %.3f ms/次 | 每拍合计 %.3f ms | 非超时错误 %u\n",
+                mb_count_, mb_disp_, mb_read_, mb_sum_ms_ / mb_count_, mb_max_ms_,
+                mb_sum_ms_ / 1000.0, mb_errcnt_);
         } else {
             printf_color(PrintColor::Yellow,
                 "[Modbus] 1000 loops: 0 次事务（无电机或 mode!=1）\n");
@@ -289,7 +313,33 @@ void ArmDriveTask::run()
         mb_max_ms_ = 0.0;
         mb_count_ = 0;
         mb_errcnt_ = 0;
+        mb_disp_ = 0;
+        mb_read_ = 0;
         mb_loops_ = 0;
+    }
+}
+
+// 一次事务失败的统一处理：只有"超时（完全无应答）"计入掉线判定，
+// CRC 错 / 地址功能码错 / 从站异常码只统计并打印原因（避免偶发帧错让电机来回上下线）。
+void ArmDriveTask::handleTxFailure(int id, int rc, const char* what)
+{
+    ++MotorMapping::errs()[id - 1];
+    if (last_rc_[id - 1] != rc) {          // 只有原因变化才打印，避免刷屏
+        last_rc_[id - 1] = rc;
+        printf_color(PrintColor::Red,
+            "[DriveTask] 电机 %d %s失败：%s\n", id, what, modbusRcName(rc));
+    }
+    if (rc == MB_RC_TIMEOUT) {
+        if (++consec_fail_[id - 1] >= OFFLINE_FAIL_LIMIT) {
+            MotorMapping::setOnline(id, false);
+            printf_color(PrintColor::Red,
+                "[DriveTask] 电机 %d 连续无应答 %u 次，判定掉线，停机！\n",
+                id, OFFLINE_FAIL_LIMIT);
+            emergency_stop_ = true;
+        }
+    } else {
+        ++nontimeout_err_[id - 1];
+        ++mb_errcnt_;
     }
 }
 
@@ -298,15 +348,30 @@ void ArmDriveTask::publishStatus(const ArmCommand& cmd, bool reachable,
 {
     ArmStatus st{};
     st.seq = cycle_;
-    st.state = (cmd.mode == 1 && reachable && !emergency_stop_) ? 1 : 0;
+
+    // state：bit0=正在按命令运行（原有含义），bit1=本次 theta/motor_pos/x/y/z 来自实测回读
+    const bool measured = actual_pose_valid_;
+    st.state = (uint8_t)(((cmd.mode == 1 && reachable && !emergency_stop_) ? 0x01 : 0x00)
+                       | (measured ? 0x02 : 0x00));
+
     for (int i = 0; i < 3; ++i) {
         st.online[i] = MotorMapping::isOnline(i + 1) ? 1 : 0;
-        if (reachable && counts) {
-            st.theta[i] = kin_.motorTheta(i);
+        if (measured) {
+            // 实测：位置用读回的计数，角度由计数换算（等价于 ×(51200/360) 后再除回来）
+            st.motor_pos[i] = (double)actual_pos_[i];
+            st.theta[i]     = MotorMapping::motorPosToAngle((double)actual_pos_[i]);
+        } else if (reachable && counts) {
+            // 还没读齐三台实测值：退回"命令值 + 命令角正解"
+            st.theta[i]     = kin_.motorTheta(i);
             st.motor_pos[i] = (double)counts[i];
         }
     }
-    st.x = fk_xyz[0]; st.y = fk_xyz[1]; st.z = fk_xyz[2];
+
+    if (measured) {
+        st.x = actual_xyz_[0]; st.y = actual_xyz_[1]; st.z = actual_xyz_[2];
+    } else {
+        st.x = fk_xyz[0]; st.y = fk_xyz[1]; st.z = fk_xyz[2];
+    }
     shm_.writeStatus(st);
 }
 

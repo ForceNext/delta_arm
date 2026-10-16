@@ -130,16 +130,28 @@ bool MotorMapping::clearStatus(ModbusMaster& master, int motorId)
     return master.writeRegister((uint8_t)motorId, Cmd::CLEAR_STATUS, 0x0001);
 }
 
-// 电机计数 → 关节角度（度）：51200 计数 = 一圈 360°
+// 电机计数 → 电机角（度）：51200 计数 = 一圈 360°（不含减速比）
 double MotorMapping::motorPosToAngle(double pos)
 {
     return pos / DEG2CNT;
 }
 
-// 关节角度（度）→ 电机计数
+// 电机角（度）→ 电机计数（不含减速比）
 double MotorMapping::angleToMotorPos(double angle)
 {
     return angle * DEG2CNT;
+}
+
+// 关节角（度）→ 电机计数：关节角 × 减速比 × (51200/360)   ← 下发方向
+double MotorMapping::jointAngleToMotorPos(double joint_angle, double gear_ratio)
+{
+    return joint_angle * gear_ratio * DEG2CNT;
+}
+
+// 电机计数 → 关节角（度）：计数 ÷ (51200/360) ÷ 减速比   ← 回读方向（实测位置正解用）
+double MotorMapping::motorPosToJointAngle(double pos, double gear_ratio)
+{
+    return pos / DEG2CNT / gear_ratio;
 }
 
 // 从 yaml 读电机候选地址与细分（覆盖默认 {1,2,3} / 16）
@@ -170,8 +182,18 @@ bool MotorMapping::probeMotor(ModbusMaster& master, int motorId)
 // 同上，返回失败原因（0=在线；-1 无应答超时 / -2 地址功能码错 / -3 CRC 错 / >0 从站异常码）
 int MotorMapping::probeMotorRc(ModbusMaster& master, int motorId)
 {
+    int32_t dummy = 0;
+    return readMotorPosRc(master, motorId, dummy);
+}
+
+// 读实测位置（0x2A，int32 计数，高 16 位在前）
+int MotorMapping::readMotorPosRc(ModbusMaster& master, int motorId, int32_t& pos)
+{
     uint16_t buf[2] = {0, 0};
-    return master.readInputRegistersRc((uint8_t)motorId, Cmd::READ_POS, 2, buf);
+    int rc = master.readInputRegistersRc((uint8_t)motorId, Cmd::READ_POS, 2, buf);
+    if (rc == MB_RC_OK)
+        pos = (int32_t)(((uint32_t)buf[0] << 16) | (uint32_t)buf[1]);
+    return rc;
 }
 
 // 配置里的所有电机是否都已在线

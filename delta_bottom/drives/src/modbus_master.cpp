@@ -2,8 +2,14 @@
 #include "modbus_crc.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 namespace {
+
+// —— 重同步（resync）预算：帧头对不上时不立即失败，在限额内继续找帧头 ——
+constexpr int kResyncMaxBytes  = 24;   // 最多丢弃多少字节去找帧头
+constexpr int kResyncBudgetMs  = 8;    // 找帧头的总时间上限（毫秒）
+constexpr int kResyncByteMs    = 5;    // 找帧头期间等待下一字节的时间（毫秒）
 
 /**
  * @brief 在帧末尾追加 CRC-16/MODBUS 校验码
@@ -68,6 +74,9 @@ ModbusMaster::ModbusMaster(SerialPort& port) : port_(port) {}
  * @note 校验顺序：帧长 → 从站地址 → 异常应答 → 功能码 → CRC，任何一步失败立即返回。
  *       发帧前先等总线静默；失败收尾时把残留字节丢弃到静默，避免迟到/多余的应答
  *       被下一次事务误认为自己的应答（这是"背靠背连发时越错越多"的根源）。
+ *       若帧头对不上（地址不是本从站、或功能码是"上一次事务那种"的迟到帧），
+ *       不再立即失败，而是在有限字节/时间内继续扫描帧头（重同步），
+ *       跳过迟到帧、别站帧与被干扰的字节后再校验 CRC。
  */
 int ModbusMaster::transact_(const std::vector<uint8_t>& req, uint8_t addr, uint8_t func,
                             uint16_t exp_len, std::vector<uint8_t>* rsp)
@@ -93,31 +102,68 @@ int ModbusMaster::transact_(const std::vector<uint8_t>& req, uint8_t addr, uint8
         return rc;
     };
 
-    // 1) 读前 3 字节：addr + func + 第三字节
-    if (port_.readExact(buf, 3, resp_timeout_ms, byte_timeout_ms) < 3) return bail(MB_RC_TIMEOUT);
+    // 重同步预算：最多丢 kResyncMaxBytes 个字节 / kResyncBudgetMs 毫秒，避免拖垮周期
+    const auto t0 = std::chrono::steady_clock::now();
+    auto over_budget = [&](int dropped) {
+        if (dropped > kResyncMaxBytes) return true;
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        return ms > kResyncBudgetMs;
+    };
 
-    if (buf[0] != addr) return bail(MB_RC_BADADDR);     // 从站地址不符
+    int dropped = 0;                    // 为找帧头而丢弃的字节数
+    int last_rc = MB_RC_BADADDR;        // 扫描没找到合格帧时对外报告的原因
+    int wait_ms = resp_timeout_ms;      // 首字节用完整超时，之后用短超时扫描
 
-    // 2) 异常应答：addr + func|0x80 + 异常码 + crc(2) = 5 字节
-    if (buf[1] == (uint8_t)(func | 0x80)) {
-        if (port_.readExact(buf + 3, 2, byte_timeout_ms, byte_timeout_ms) < 2) return bail(MB_RC_TIMEOUT);
-        uint16_t crc_rx = (uint16_t)(buf[3] | (buf[4] << 8));
-        if (crc16Modbus(buf, 3) != crc_rx) return bail(MB_RC_BADCRC);
-        return bail(buf[2]);            // 返回异常码
+    while (true) {
+        // 1) 找本从站地址字节（对不上就丢掉继续找）
+        if (port_.readExact(buf, 1, wait_ms, byte_timeout_ms) < 1) return bail(MB_RC_TIMEOUT);
+        wait_ms = kResyncByteMs;
+        if (buf[0] != addr) {
+            last_rc = MB_RC_BADADDR;
+            if (over_budget(++dropped)) break;
+            continue;
+        }
+
+        // 2) 读功能码
+        if (port_.readExact(buf + 1, 1, kResyncByteMs, byte_timeout_ms) < 1) return bail(MB_RC_TIMEOUT);
+
+        // 2a) 异常应答：addr + func|0x80 + 异常码 + CRC(2) = 5 字节
+        if (buf[1] == (uint8_t)(func | 0x80)) {
+            if (port_.readExact(buf + 2, 3, byte_timeout_ms, byte_timeout_ms) < 3) return bail(MB_RC_TIMEOUT);
+            uint16_t crc_rx = (uint16_t)(buf[3] | (buf[4] << 8));
+            if (crc16Modbus(buf, 3) != crc_rx) {
+                last_rc = MB_RC_BADCRC;
+                if (over_budget(dropped += 2)) break;
+                continue;
+            }
+            return bail(buf[2]);        // 从站异常码（>0）
+        }
+
+        // 2b) 功能码不是本次期望的（多半是上一帧的迟到应答，如读事务收到 0x10 回显）→ 跳过
+        if (buf[1] != func) {
+            last_rc = MB_RC_BADADDR;
+            if (over_budget(dropped += 2)) break;
+            continue;
+        }
+
+        // 3) 数据帧：收满期望长度
+        if (port_.readExact(buf + 2, exp_len - 2, byte_timeout_ms, byte_timeout_ms) < (ssize_t)(exp_len - 2))
+            return bail(MB_RC_TIMEOUT);
+
+        // 4) CRC 校验
+        uint16_t crc_rx = (uint16_t)(buf[exp_len - 2] | (buf[exp_len - 1] << 8));
+        if (crc16Modbus(buf, exp_len - 2) != crc_rx) {
+            last_rc = MB_RC_BADCRC;
+            if (over_budget(dropped += 2)) break;
+            continue;
+        }
+
+        if (rsp) rsp->assign(buf + 1, buf + (exp_len - 2));  // 去 addr 与 CRC，留 func+数据区
+        return MB_RC_OK;
     }
 
-    if (buf[1] != func) return bail(MB_RC_BADADDR);     // 功能码不符
-
-    // 3) 读剩余字节到期望长度
-    if (port_.readExact(buf + 3, exp_len - 3, byte_timeout_ms, byte_timeout_ms) < (ssize_t)(exp_len - 3))
-        return bail(MB_RC_TIMEOUT);
-
-    // 4) CRC 校验
-    uint16_t crc_rx = (uint16_t)(buf[exp_len - 2] | (buf[exp_len - 1] << 8));
-    if (crc16Modbus(buf, exp_len - 2) != crc_rx) return bail(MB_RC_BADCRC);
-
-    if (rsp) rsp->assign(buf + 1, buf + (exp_len - 2));  // 去 addr 与 CRC，留 func+数据区
-    return MB_RC_OK;
+    return bail(last_rc);               // 重同步超预算，按最后一次原因上报
 }
 
 /**

@@ -46,13 +46,27 @@ private:
     bool motors_ready_ = false;            // 所有电机已在线并使能
     uint8_t prev_online_mask_ = 0;         // 上次打印的在线位掩码（避免刷屏）
 
-    int next_motor_ = 1;                   // 轮转下发游标（1~3）：每拍只更新一台
+    int next_motor_ = 1;                   // （保留：等待上电阶段轮转探测用）
     int wait_probe_addr_ = 1;              // 等待上电阶段轮转探测的地址（1~3）
     int last_rc_[3] = {0, 0, 0};           // 每台上次失败原因（仅原因变化时打印，避免刷屏）
     uint64_t nontimeout_err_[3] = {0, 0, 0}; // 每台非超时失败累计（-2 地址/功能码、-3 CRC、>0 异常码）
     uint32_t mb_errcnt_ = 0;               // 统计窗口内非超时事务失败次数
 
-    // 发布状态到共享内存（online 反映真实在线状态）
+    // —— 6 拍一轮：发M1→读M1→发M2→读M2→发M3→读M3（每拍只做 1 次 Modbus 事务）——
+    // 一次事务约 2.9~3.2 ms，4 ms 周期内装不下"下发+回读"两次，
+    // 因此把下发与回读拆到不同拍；一轮 6 拍 = 24 ms，每台下发/回读各约 41.7 Hz。
+    int cycle_step_ = 0;                   // 0..5：偶数拍下发(id=step/2+1)，奇数拍回读同一台
+    int32_t actual_pos_[3] = {0, 0, 0};    // 实测电机位置（计数，下标 = 电机号-1）
+    double  actual_joint_[3] = {0, 0, 0};  // 实测关节角（度，= 计数 ÷(51200/360) ÷ 减速比）
+    bool    actual_valid_[3] = {false, false, false}; // 该台是否已成功回读过
+    bool    actual_pose_valid_ = false;    // 三台都有实测值，x/y/z 为实测正解结果
+    double  actual_xyz_[3] = {0, 0, 0};    // 实测正解出的末端坐标（mm）
+    uint32_t mb_disp_ = 0, mb_read_ = 0;   // 统计窗口内下发/回读事务次数
+
+    // 一次事务失败的统一处理：仅"超时（无应答）"计入掉线判定，其余只统计+打印原因
+    void handleTxFailure(int id, int rc, const char* what);
+
+    // 发布状态到共享内存（x/y/z 在有三台实测值时改为实测正解结果）
     void publishStatus(const ArmCommand& cmd, bool reachable,
                        const uint32_t* counts, const double* fk_xyz);
 };
