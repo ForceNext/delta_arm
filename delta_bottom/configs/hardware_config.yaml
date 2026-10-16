@@ -5,20 +5,20 @@ serial:
 motors:
   - addr: 1
     name: "motor_1"
-    speed_rpm: 1000
-    accel: 200
+    speed_rpm: 500
+    accel: 50
     microstep: 16
 
   - addr: 2
     name: "motor_2"
-    speed_rpm: 1000
-    accel: 200
+    speed_rpm: 500
+    accel: 50
     microstep: 16
 
   - addr: 3
     name: "motor_3"
-    speed_rpm: 1000
-    accel: 200
+    speed_rpm: 500
+    accel: 50
     microstep: 16
 
 joint:

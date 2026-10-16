@@ -173,6 +173,29 @@ void MotorMapping::loadMotorAddrs(const std::string& path)
     }
 }
 
+// 从 yaml 的 joint.gear_ratio 读三个主动臂减速比（电机角 = 关节角 × 减速比）
+// 读不到就保持默认 1.0，并醒目告警——减速比错了角度会整体差一个倍数，很危险
+void MotorMapping::loadGearRatios(const std::string& path)
+{
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        auto g = root["joint"]["gear_ratio"][0];   // [g1, g2, g3]
+        for (int i = 0; i < 3; ++i) {
+            double v = g[i].as<double>();
+            if (v <= 0.0) {                        // 非法值会毁掉 ÷减速比 的换算
+                std::cerr << "\033[1;31m[警告] gear_ratio[" << i << "]=" << v
+                          << " 非法（须 >0），按 1.0 处理\033[0m\n";
+                v = 1.0;
+            }
+            g_gear[i] = v;
+        }
+        std::cerr << "减速比: " << g_gear[0] << ", " << g_gear[1] << ", " << g_gear[2] << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "\033[1;31m[警告] 读取 joint.gear_ratio 失败(" << e.what()
+                  << ")，减速比按 1.0 处理！角度会差一个倍数，请检查 hardware_config.yaml\033[0m\n";
+    }
+}
+
 // 读 0x2A 实时位置判断电机是否在线（有有效应答即在线）
 bool MotorMapping::probeMotor(ModbusMaster& master, int motorId)
 {

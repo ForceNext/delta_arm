@@ -41,8 +41,11 @@ public:
     MotorMapping() = default;
     ~MotorMapping() = default;
 
-    // —— 配置地址 ——
+    // —— 配置地址 / 减速比 ——
     static void loadMotorAddrs(const std::string& path);  // 从 yaml 读候选地址到 g_cfg_addr
+    // 从 yaml 的 joint.gear_ratio 读三个主动臂减速比（电机角 = 关节角 × 减速比）
+    static void loadGearRatios(const std::string& path);
+    static double gearRatio(int i) { return g_gear[i]; }  // 下标 0~2 = 电机号-1
 
     // 在线状态 / 失败计数访问（供控制循环使用）
     static uint64_t (&errs())[3] { return g_err; }        // 每台累计失败次数（下标 = 地址-1）
@@ -97,6 +100,7 @@ private:
     static inline uint16_t g_microstep[3] = {16, 16, 16};       // 每台细分（下标 = 地址-1），默认 16
     static inline uint64_t g_err[3] = {0, 0, 0};                // 每台累计失败次数（下标 = 地址-1）
     static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
+    static inline double g_gear[3] = {1.0, 1.0, 1.0};           // 三个主动臂减速比（下标 = 电机号-1）
 };
 
 #endif // MOTOR_MAPPING_HPP

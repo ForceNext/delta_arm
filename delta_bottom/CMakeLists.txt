@@ -41,14 +41,9 @@ target_link_libraries(common PUBLIC
 )
 
 # ---------------------------------------------------------------------------
-# drives: 串口驱动（SerialPort）
+# drives: 串口驱动（SerialPort / ModbusMaster）+ 电机映射（MotorMapping）
 # ---------------------------------------------------------------------------
 add_subdirectory(drives)
-
-# ---------------------------------------------------------------------------
-# kinematics: 电机映射 / 扫描（MotorMapping）+ 正逆解（Kinematics）
-# ---------------------------------------------------------------------------
-add_subdirectory(kinematics)
 
 # ---------------------------------------------------------------------------
 # user/task: 机械臂驱动任务（arm_drive_task）
@@ -62,6 +57,5 @@ add_executable(delta_bottom user/main.cpp)
 target_link_libraries(delta_bottom PRIVATE
   common
   drives
-  kinematics
   task
 )

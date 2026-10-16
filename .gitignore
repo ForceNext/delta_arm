@@ -1,2 +1,5 @@
 # 编辑器配置（VSCode 本地设置，不应入库）
 .vscode/
+
+# 本地运行状态（read_angles.py 的参考点）
+delta_bottom/tools/.angle_ref.json

@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,26 +28,35 @@
 // System V 信号量 key（上下位机必须使用同一个 key，任意非零整数，避免与其他程序冲突）
 #define ARM_SEM_KEY 0x5A11
 
-// 上位机 -> 底层：命令（xyz 是末端目标坐标，单位 mm，z 正方向向上）
+// 共享内存布局版本（放在 ArmCommand 的魔数字段里）。
+// 布局一变就改这个值：底层 connect() 时若发现魔数不符，会把整块内存清零，
+// 避免"尺寸相同但字段含义变了"的旧数据被按新布局误读（例如旧 x/y/z 被当成关节角 → 电机大幅乱动）。
+#define ARM_SHM_MAGIC 0x444C5431u   // 'D''L''T''1'
+
+// 上位机 -> 底层：命令（三个【关节角】，单位度；坐标正逆解已移到上位机）
+// 注意：这里传的是关节角，底层负责 电机角 = 关节角 × 减速比(hardware_config.yaml 的 gear_ratio)，
+//       再 ×(51200/360) 转成计数下发。
 struct ArmCommand
 {
-  uint64_t seq = 0;   // 写入序号（每次写 +1）
-  uint8_t mode = 0;   // 0=空闲  1=位置模式（底层逆解后下发关节角）
-  double x = 0.0;     // 末端 x 坐标（mm）
-  double y = 0.0;     // 末端 y 坐标（mm）
-  double z = 0.0;     // 末端 z 坐标（mm，正方向向上，平台在基座下方为负）
+  uint64_t seq = 0;                        // 写入序号（每次写 +1）
+  uint8_t mode = 0;                        // 0=空闲  1=角度模式（底层直接下发这三个关节角）
+  uint8_t reserved[3] = {0, 0, 0};         // 对齐填充（勿使用）
+  uint32_t magic = ARM_SHM_MAGIC;          // 布局版本魔数（见 ARM_SHM_MAGIC）
+  double theta[3] = {0.0, 0.0, 0.0};       // 三个角度（度），含义由底层开关决定（arm_drive_task.cpp）：
+                                           //   APPLY_GEAR_RATIO_ON_SEND=false（当前）=【电机角】直接下发
+                                           //   APPLY_GEAR_RATIO_ON_SEND=true        =【关节角】，底层先×减速比
 };
 
 // 底层 -> 上位机：状态
 struct ArmStatus
 {
-  uint64_t seq = 0;                  // 写入序号
-  uint8_t state = 0;                 // 0=空闲 1=运行
-  uint8_t online[3] = {0, 0, 0};     // 各电机在线标志
-  double theta[3] = {0, 0, 0};       // 实际下发的三个电机角（度，已乘传动比）
-  double motor_pos[3] = {0, 0, 0};   // 实际下发的电机位置（计数）
-  double x = 0.0, y = 0.0, z = 0.0;  // 回显末端坐标（mm）
-};
+  uint64_t seq = 0;                          // 写入序号（= 控制循环计数）
+  uint8_t state = 0;                         // bit0=1 正在按命令运行；bit1=1 本次数据来自实测回读
+  uint8_t online[3] = {0, 0, 0};             // 各电机在线标志
+  double theta[3] = {0, 0, 0};               // 三个电机角（度，已乘减速比）：实测优先，未读到时为命令值
+  double motor_pos[3] = {0, 0, 0};           // 三个电机位置（计数）：实测优先，未读到时为命令值
+  double joint_theta[3] = {0, 0, 0};         // 三个【实测关节角】（度）= 计数 ÷(51200/360) ÷减速比
+};                                           // 供上位机直接做正解/显示，无需再除减速比
 
 // 共享内存布局：锁不放在这里 —— sem_com 是独立的 System V 信号量，用 key 标识，
 // 不在共享内存块内部。
@@ -55,6 +65,18 @@ struct ArmSharedData
   ArmCommand command;
   ArmStatus status;
 };
+
+// 布局自检（编译期）：上下位机必须严格一致，Python 侧 tools/*.py 里也有对应的 sizeof/offset 断言。
+// 一旦这里报错，说明结构体改了，必须同步修改 tools/set_angle.py、tools/upper_sim.py，
+// 并递增 ARM_SHM_MAGIC。
+static_assert(sizeof(ArmCommand) == 40, "ArmCommand 大小变了：请同步 Python 脚本并递增 ARM_SHM_MAGIC");
+static_assert(sizeof(ArmStatus) == 88, "ArmStatus 大小变了：请同步 Python 脚本并递增 ARM_SHM_MAGIC");
+static_assert(sizeof(ArmSharedData) == 128, "ArmSharedData 大小变了：请同步 Python 脚本并递增 ARM_SHM_MAGIC");
+static_assert(offsetof(ArmCommand, mode) == 8, "ArmCommand.mode 偏移变了");
+static_assert(offsetof(ArmCommand, magic) == 12, "ArmCommand.magic 偏移变了");
+static_assert(offsetof(ArmCommand, theta) == 16, "ArmCommand.theta 偏移变了");
+static_assert(offsetof(ArmStatus, motor_pos) == 40, "ArmStatus.motor_pos 偏移变了");
+static_assert(offsetof(ArmStatus, joint_theta) == 64, "ArmStatus.joint_theta 偏移变了");
 
 /*!
  * 基于 POSIX shm_open 的共享内存对象模板（仿照原 SharedMemory.h）。
@@ -248,12 +270,34 @@ class ArmSharedMemory
   // 构造时打开互斥锁（首次创建者初始化为 1，其余进程打开现有锁）
   ArmSharedMemory() : lock_(ARM_SEM_KEY) {}
 
-  // 连接共享内存：首次启动的进程创建，其余附加
+  // 连接共享内存：不存在则创建、已存在则附加，**并且每次启动都把整块清零**。
+  // 清零是刻意的安全设计：
+  //   ① 上一次运行可能遗留 mode=1 + 某组角度，接上电机再启动时会立刻按旧角度动作；
+  //   ② 旧版本/外来程序留下的同尺寸数据字段含义可能不同（例如旧 x/y/z 被当成角度）；
+  //   ③ 清零后 command.mode=0，底层在收到上位机的新命令前不会下发任何指令。
   bool connect(const std::string& name = ARM_SHARED_MEMORY_NAME) {
     try {
       obj_.attach(name);  // 已存在则附加
     } catch (const std::exception&) {
-      obj_.createNew(name);  // 不存在则创建
+      // allowOverwrite=true：即使已有同名对象（甚至尺寸不同）也复用它并 ftruncate 到正确大小
+      obj_.createNew(name, true);
+    }
+
+    ArmSharedData* d = obj_.get();
+    const uint32_t prev_magic = d->command.magic;
+    const uint8_t  prev_mode  = d->command.mode;
+
+    *d = ArmSharedData{};   // 值初始化：command/status 全部归零，command.magic 恢复为默认魔数
+
+    if (prev_magic != ARM_SHM_MAGIC && prev_magic != 0) {
+      printf_color(PrintColor::Yellow,
+                   "[Shared Memory] 检测到旧/外来数据（magic=0x%08X ≠ 0x%08X），已清零\n",
+                   prev_magic, ARM_SHM_MAGIC);
+    } else if (prev_mode != 0) {
+      printf_color(PrintColor::Yellow,
+                   "[Shared Memory] 上次遗留 mode=%u（可能带着旧角度命令），已清零\n", prev_mode);
+    } else {
+      printf_color(PrintColor::Green, "[Shared Memory] 已清零，等待上位机写入命令\n");
     }
     return true;
   }
