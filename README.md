@@ -14,10 +14,10 @@ Linux 下用 **Modbus RTU**（RS485 / USB 转串口）控制 3 台 **正点原�
 | Modbus 主站 `ModbusMaster`（组帧 + CRC + 事务 + 失败原因返回码） | ✅ 可用 |
 | 电机封装 `MotorMapping`（探测 / 初始化 / 使能 / 下发 / 回读 / 角度换算 / 减速比） | ✅ 可用 |
 | 共享内存 `ArmSharedMemory`（128 字节，启动清零） | ✅ 可用 |
-| 控制循环 `ArmDriveTask::run()` | ⚠️ **已清空成骨架**，只保留周期打印，运动逻辑待重写 |
+| 控制循环 `ArmDriveTask::run()` | ✅ 读共享内存三个角度，**每拍只给一台电机发绝对位置**（1→2→3 轮转，每台约 66 Hz） |
 
-> `run()` 现在只有一行 `print_loop_rate();`。重写时可从 git 历史取回参考实现：
-> `git log --oneline -- delta_bottom/user/task/src/arm_drive_task.cpp`
+> `theta[3]` 按**关节角**下发：`计数 = θ × 减速比 × 51200/360`（减速比取 `hardware_config.yaml` 的 `joint.gear_ratio`）。
+> 若上位机给的是电机角，把 `arm_drive_task.cpp` 里的 `THETA_IS_JOINT_ANGLE` 改成 `false`。
 
 ## 目录结构
 
@@ -63,7 +63,7 @@ struct ArmStatus {           // 底层 → 上位机
 
 - **每次启动整块清零**（`mode=0`）：所以顺序是「先启动底层，再让上位机发命令」，残留的旧命令不会被执行。
 - `magic` 不符（旧布局、或别的程序留下的同尺寸内存）也会被清零，避免按新字段误读旧数据。
-- `theta[3]` 是**关节角还是电机角由底层实现决定** —— 当前骨架未实现下发；重写时需与 `tools/*.py` 的 `--unit motor|joint` 保持一致。
+- `theta[3]` 是**关节角**（会乘 `joint.gear_ratio` 再换算计数）；`tools/set_angle.py --unit` 默认 `joint`，两者必须一致。
 
 ## 构建与运行
 
@@ -137,12 +137,18 @@ python3 tools/set_angle.py 10 10 10                              # 发布三个�
 1. **1 号（偶尔 3 号）驱动器会额外吐帧**：对一次读请求有时回「数据帧 + 异常帧 `01 84 04` + 异常帧 `01 84 01`」，三个帧 CRC 都正确；2 号从未出现。后果是回读可能被判成"从站异常码 0x04"。疑似物理层问题，建议先查**共地、120Ω 终端电阻、A/B 双绞与屏蔽**，再逐台隔离验证。
 2. **停机后角度会缓慢漂移**（实测 2、3 号各下沉 2~3° 电机角）：停机后并没有刚性保持位置，需要保持时得显式发刹车/使能。
 3. **`argv[1]` 双重语义**：线程配置与硬件配置共用一个路径参数。
-4. **`run()` 是空骨架**：没有在线探测 / 使能 / 下发 / 回读 / 掉线保护。
+4. **控制循环还很简**：`ArmStatus` 只发布了 `seq`（每拍递增，供工具判活）、`state`、`online[]`；**还没有回读**，所以 `theta/motor_pos/joint_theta` 恒为 0、`state` 的 bit1 也不置位。没有掉线保护；单次下发失败只在日志里提示一行，靠下一拍轮转重发收敛。
 
-## 重写 `run()` 的建议顺序
+## `run()` 当前逻辑
 
-1. 轮转探测（`probeMotorRc`）→ 全部在线后 `initMotor` + `enableMotors`；
-2. 读 `ArmCommand`：`mode==1` 时把 `theta[3]` 换算成计数（`angleToMotorPos` / `jointAngleToMotorPos`）；
-3. `moveAbsoluteRc` 下发、`readMotorPosRc` 回读，注意**一拍只做一次 Modbus 事务**（下发与回读分到不同拍）；
-4. 回读值填进 `ArmStatus`（`theta` / `motor_pos` / `joint_theta`），按 `seq` 递增发布；
-5. 掉线保护：**只把"超时（无应答）"计入掉线**，CRC 错 / 异常码只统计打印；判定掉线后 `stopMotor` 并停机等人工重启。
+1. 读共享内存 `ArmCommand`（三个目标角度 + `mode`），并发布 `ArmStatus`（`seq` 每拍递增，供工具判活）；
+2. 首次下发前 `ensureDrivesReady()`：每 100 ms 轮转探测一台 → 三台在线后逐台 `initMotor`（协议 Modbus + 细分 16）→ `enableMotors`；
+3. **在线判定**：每台"连续无应答"达到 **10 次**（约 150 ms）时，单独探一次该电机
+   - 探测有应答 → 仍按在线处理（清零计数）；探测无应答 → 判定掉线，`online[i]=0`，跳过该轴；
+   - 任何"有应答"的结果（成功 / CRC 错 / 从站异常码）都会清零连续无应答计数——只有真正收不到任何字节才算超时；
+4. **掉线恢复**：已掉线的电机每 **1 s** 轮转重探一台，探测到就置回在线并自动重新纳入下发；
+5. `mode != 1` 视为空闲，不下发；
+6. 每个周期只给**一台**电机发 `moveAbsoluteRc`：角度 → 电机计数 → 绝对位置，`1→2→3` 轮转；
+7. 下发失败只在"原因变化"时打印一行（否则会刷屏），下一拍轮转时自动重发。
+
+待补充：回读实测位置并发布 `ArmStatus`（`theta/motor_pos/joint_theta` 现在恒为 0）、`0xF9/0xFB` 错误状态清除与校验。

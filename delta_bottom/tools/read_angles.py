@@ -85,14 +85,19 @@ def read_from_shm():
     counts = [int(data.status.motor_pos[i]) for i in range(3)]
     online = [bool(data.status.online[i]) for i in range(3)]
     seq = data.status.seq
+    measured = bool(data.status.state & 0x02)
     sa.sem_v(semid)
+    if not measured:
+        print("[提示] 底层在运行，但它还没有实现回读实测值（state bit1=0），"
+              "共享内存里的角度/计数都是 0、不可用。\n"
+              "       要看真实角度：先停掉底层，本脚本会改为直连串口读取。", file=sys.stderr)
     return counts, online, f"共享内存（底层运行中，status.seq={seq}）"
 
 
 # ---------------------------------------------------------------------------
 # 数据来源 2：底层没跑 → 直连串口读 0x2A
 # ---------------------------------------------------------------------------
-def read_from_serial(trials=3):
+def read_from_serial(trials=5):
     fd = os.open(DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:
         a = termios.tcgetattr(fd)
@@ -114,7 +119,7 @@ def read_from_serial(trials=3):
 
         counts, online, notes = [], [], []
         for addr in (1, 2, 3):
-            got, raw = None, ""
+            got, raw, bad = None, "", 0
             for _ in range(trials):
                 termios.tcflush(fd, termios.TCIFLUSH)
                 os.write(fd, pb.build_read(addr, 0x2A, 2))
@@ -127,15 +132,20 @@ def read_from_serial(trials=3):
                         if d:
                             buf += d
                 raw = buf.hex(" ").upper() if buf else "(超时/无应答)"
-                if len(buf) >= 9 and buf[0] == addr and buf[1] == 0x04:
+                # 必须校验 CRC：这几台驱动器偶发坏帧，不校验会读出天量离谱数值
+                if (len(buf) >= 9 and buf[0] == addr and buf[1] == 0x04
+                        and pb.crc16(buf[:7]).to_bytes(2, "little") == buf[7:9]):
                     got = struct.unpack(">i", buf[3:7])[0]
                     break
+                if buf:
+                    bad += 1
                 time.sleep(0.03)
             counts.append(got if got is not None else 0)
             online.append(got is not None)
             notes.append(raw)
             if got is None:
-                print(f"[警告] 地址 {addr} 读取失败：{raw}", file=sys.stderr)
+                print(f"[警告] 地址 {addr} 读取失败（{bad} 次应答全部 CRC 校验失败或超时）：{raw}",
+                      file=sys.stderr)
         return counts, online, f"直连串口 {DEV} @ {BAUD}"
     finally:
         os.close(fd)
@@ -207,8 +217,10 @@ def main():
     print(hdr)
     for i in range(3):
         c = counts[i]
-        line = (f"  {i+1}   {'是' if online[i] else '否'}   {c:9d}   "
-                f"{c / DEG2CNT:10.3f}   {c / DEG2CNT / ratio[i]:9.3f}  ")
+        if online[i]:
+            line = (f"  {i+1}   是   {c:9d}   {c / DEG2CNT:10.3f}   {c / DEG2CNT / ratio[i]:9.3f}  ")
+        else:                                  # 读失败：显示 -- 而不是 0，避免误解
+            line = f"  {i+1}   否         --          --           --  "
         ax = {"axis": i + 1, "online": online[i], "counts": c,
               "motor_deg": round(c / DEG2CNT, 4),
               "joint_deg": round(c / DEG2CNT / ratio[i], 4)}

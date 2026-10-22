@@ -3,9 +3,9 @@
 """
 向共享内存发布三个【角度】（单位：度）。
 
-角度含义由底层开关 APPLY_GEAR_RATIO_ON_SEND（user/task/src/arm_drive_task.cpp）决定：
-    false（当前）：theta 直接作为【电机角】 → 计数 = theta × 51200/360
-    true         ：theta 作为【关节角】   → 计数 = theta × 减速比 × 51200/360
+角度含义由底层开关 THETA_IS_JOINT_ANGLE（user/task/src/arm_drive_task.cpp）决定：
+    true （当前）：theta 作为【关节角】 → 计数 = theta × 减速比 × 51200/360
+    false        ：theta 直接作为【电机角】 → 计数 = theta × 51200/360
 
 注意：共享内存里不再是末端 x/y/z 坐标（坐标正逆解已移到上位机）。
 
@@ -19,11 +19,12 @@
   python3 set_angle.py                  # 不带参数则交互式输入
   python3 set_angle.py --idle           # 只写 mode=0（空闲），底层停止下发
 
-护栏（只剩"不拿垃圾当基准"这一条；**跳变大小不限幅、不拒绝**）：
-  * 底层没在运行（status.seq 不变）/ 还没回传实测值 → 拒绝写入（否则等于以 0 为基准乱动）；
+护栏（只拦"底层没在运行"；**跳变大小不限幅、不拒绝**）：
+  * 底层没在运行（status.seq 不变）→ 拒绝写入（共享内存里可能是上次的陈旧状态）；
+  * 底层在跑但还没回传实测值 → 只提示，不阻止写入；
   * 跳变超过 --hint-jump（默认 20°，单位同 --unit）→ **只打印提示，照常下发**；
   * 用 --force 可跳过上面的拒绝。
-  --unit 必须与底层开关 APPLY_GEAR_RATIO_ON_SEND 一致：false→motor（当前），true→joint。
+  --unit 必须与底层开关 THETA_IS_JOINT_ANGLE 一致：true→joint（当前，会乘减速比），false→motor。
 
 提示：脚本被 kill -9 / 异常退出时，共享内存里可能残留 mode=1 + 上次的角度；
      接电机重启底层前先运行一次 --idle，避免底层一进入运行就按旧角度下发。
@@ -153,8 +154,8 @@ def parse_args():
     ap = argparse.ArgumentParser(description="向共享内存发布三个角度（度）")
     ap.add_argument("theta", nargs="*", type=float, help="三个角度（度），不给则交互式输入")
     ap.add_argument("--idle", action="store_true", help="只写 mode=0（空闲）")
-    ap.add_argument("--unit", choices=["motor", "joint"], default="motor",
-                    help="角度含义，必须与底层 APPLY_GEAR_RATIO_ON_SEND 一致（默认 motor）")
+    ap.add_argument("--unit", choices=["motor", "joint"], default="joint",
+                    help="角度含义，必须与底层 THETA_IS_JOINT_ANGLE 一致（当前=joint）")
     ap.add_argument("--hint-jump", type=float, default=20.0,
                     help="跳变超过该值（度）只打印提示，不阻止下发，默认 20")
     ap.add_argument("--force", action="store_true", help="跳过护栏")
@@ -194,9 +195,9 @@ def safety_check(data, targets, unit, hint_jump, force):
     if force:
         return True
     if not (state & 0x02):
-        print("\033[1;31m[拒绝] 底层还没回传实测值（state bit1=0）：此刻写角度会以\"0\"为基准，\n"
-              "       属于拿垃圾当基准，请等底层回传实测值后再试，或用 --force 跳过。\033[0m")
-        return False
+        # 底层在跑但还没回读实测值：目标是你显式给的，基准只用于"跳变提示"，不阻止写入
+        print("\033[1;33m[提示] 底层还没回传实测值（state bit1=0），无法预估跳变量，按给定角度直接下发。\033[0m")
+        return True
     ref = [data.status.theta[i] if unit == "motor" else data.status.joint_theta[i]
            for i in range(3)]
     worst = max(abs(targets[i] - ref[i]) for i in range(3))
