@@ -42,9 +42,9 @@ struct ArmCommand
   uint8_t mode = 0;                        // 0=空闲  1=角度模式（底层直接下发这三个关节角）
   uint8_t reserved[3] = {0, 0, 0};         // 对齐填充（勿使用）
   uint32_t magic = ARM_SHM_MAGIC;          // 布局版本魔数（见 ARM_SHM_MAGIC）
-  double theta[3] = {0.0, 0.0, 0.0};       // 三个角度（度）。是【关节角】还是【电机角】由底层实现决定：
-                                           //   当前 run() 是骨架、未实现下发；重写下发逻辑时需与
-                                           //   tools/*.py 的 --unit motor|joint 保持一致
+  double theta[3] = {0.0, 0.0, 0.0};       // 三个【关节角】（度），相对零点位形
+                                           //   底层换算：限幅 → × joint.dir → × joint.gear_ratio → 计数
+                                           //   （arm_drive_task.cpp 的 THETA_IS_JOINT_ANGLE 可切换成电机角语义）
 };
 
 // 底层 -> 上位机：状态

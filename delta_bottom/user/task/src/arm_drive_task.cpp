@@ -195,7 +195,7 @@ void ArmDriveTask::run()
     // ⑤ mode != 1 表示上位机空闲，不下发
     if (cmd.mode != 1) return;
 
-    // ⑥ 每个周期只发一台，1→2→3 轮转（5ms 一拍 → 每台约 66Hz）
+    // ⑥ 每个周期只发一台，1→2→3 轮转（thread_t=4ms → 每台约 83Hz；5ms 时为 66Hz）
     const int id = next_motor_;
     next_motor_ = (next_motor_ % 3) + 1;
     if (!MotorMapping::isOnline(id)) return;
