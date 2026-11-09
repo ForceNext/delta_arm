@@ -49,6 +49,13 @@ public:
 
     // 从 yaml 的 joint.min_pos / joint.max_pos 读三个关节的限幅（单位：度，关节角）
     // 读不到/非法时按 ±180° 处理（等于不限幅），并打印醒目告警
+    // 从 yaml 的 motors[].speed_rpm / accel 读每台的下发参数
+    //   speed_rpm：0~6000 RPM；accel：0~200 档位（200 = 最大，0 = 无加减速直接启动）
+    // 读不到/非法时回落到安全默认（300 RPM / 档位 30）并告警
+    static void loadMotionParams(const std::string& path);
+    static uint16_t motorSpeed(int i) { return g_speed[i]; }   // 下标 0~2 = 电机号-1
+    static uint8_t  motorAccel(int i) { return g_accel[i]; }
+
     static void loadJointLimits(const std::string& path);
     static double minJointAngle(int i) { return g_joint_min[i]; }
     static double maxJointAngle(int i) { return g_joint_max[i]; }
@@ -110,6 +117,8 @@ private:
     static constexpr double DEG2CNT = MOTOR_RESOLUTION / 360.0;
     static inline std::vector<uint8_t> g_cfg_addr = {1, 2, 3};  // 配置里的所有从站地址
     static inline uint16_t g_microstep[3] = {16, 16, 16};       // 每台细分（下标 = 地址-1），默认 16
+    static inline uint16_t g_speed[3] = {300, 300, 300};        // 每台下发速度 RPM（默认较温和）
+    static inline uint8_t  g_accel[3] = {30, 30, 30};           // 每台加减速档位 0~200
     static inline uint64_t g_err[3] = {0, 0, 0};                // 每台累计失败次数（下标 = 地址-1）
     static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
     static inline double g_gear[3] = {1.0, 1.0, 1.0};           // 三个主动臂减速比（下标 = 电机号-1）

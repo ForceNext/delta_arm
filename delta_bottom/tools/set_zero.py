@@ -62,8 +62,8 @@ def bottom_alive():
         return False
 
 
-def open_port():
-    fd = os.open(DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+def open_port(dev=None):
+    fd = os.open(dev or DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     a = termios.tcgetattr(fd)
     iflag, oflag, cflag, lflag, isp, osp, cc = a
     cflag = (cflag & ~termios.CSIZE) | termios.CS8
@@ -107,6 +107,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只读位置并打印要发的帧，不写入")
     ap.add_argument("--ask", action="store_true", help="清零前询问一次")
     ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)  # 兼容旧用法，无作用
+    ap.add_argument("--dev", default=None, help="串口设备，默认 /dev/ttyACM0")
     args = ap.parse_args()
 
     try:
@@ -122,7 +123,7 @@ def main():
         return 1
 
     try:
-        counts, online, _ = ra.read_from_serial()
+        counts, online, _ = ra.read_from_serial(dev=args.dev)
     except Exception as e:
         print(f"[错误] 打开串口失败（{e}）：先停掉 delta_bottom。", file=sys.stderr)
         return 1
@@ -146,7 +147,7 @@ def main():
             print("已取消")
             return 0
 
-    fd = open_port()
+    fd = open_port(args.dev)
     ok_all = True
     try:
         for a in axes:
@@ -158,7 +159,7 @@ def main():
         os.close(fd)
 
     time.sleep(0.15)
-    after, online2, _ = ra.read_from_serial()
+    after, online2, _ = ra.read_from_serial(dev=args.dev)
     print("\n清零后（应以当前位置为零点）：")
     for i in range(3):
         tag = "" if online2[i] else "   ← 读失败"

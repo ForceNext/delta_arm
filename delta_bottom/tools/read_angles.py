@@ -45,7 +45,7 @@ import set_angle as sa                      # noqa: E402  （复用共享内存/
 
 DEG2CNT = 51200.0 / 360.0                   # 51200 计数 = 一圈
 REF_FILE = os.path.join(HERE, ".angle_ref.json")
-DEV = "/dev/ttyACM0"
+DEV = "/dev/ttyACM0"      # 可用 --dev 指定，如 /dev/ttyACM1、/dev/ttyUSB0
 BAUD = 256000
 
 
@@ -97,8 +97,8 @@ def read_from_shm():
 # ---------------------------------------------------------------------------
 # 数据来源 2：底层没跑 → 直连串口读 0x2A
 # ---------------------------------------------------------------------------
-def read_from_serial(trials=5):
-    fd = os.open(DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+def read_from_serial(trials=5, dev=None):
+    fd = os.open(dev or DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:
         a = termios.tcgetattr(fd)
         iflag, oflag, cflag, lflag, isp, osp, cc = a
@@ -160,6 +160,7 @@ def main():
     ap.add_argument("--ratio", type=float, nargs=3, metavar=("G1", "G2", "G3"),
                     help="覆盖减速比（默认读 hardware_config.yaml）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出")
+    ap.add_argument("--dev", default=None, help="串口设备，默认 /dev/ttyACM0")
     args = ap.parse_args()
 
     if args.clear:
@@ -174,7 +175,7 @@ def main():
 
     res = read_from_shm()
     if res is None:
-        res = read_from_serial()
+        res = read_from_serial(dev=args.dev)
     counts, online, source = res
 
     # 参考点
@@ -203,18 +204,20 @@ def main():
 
     out = {"source": source, "ratio": ratio, "ref_source": ref_src,
            "ref_counts": ref, "axes": []}
-    print(f"数据来源：{source}")
-    print(f"减速比  ：{ratio[0]}, {ratio[1]}, {ratio[2]}    (51200 计数 = 一圈 = 360°)")
+    emit = (lambda *a, **k: None) if args.json else print   # --json 时只输出 JSON
+
+    emit(f"数据来源：{source}")
+    emit(f"减速比  ：{ratio[0]}, {ratio[1]}, {ratio[2]}    (51200 计数 = 一圈 = 360°)")
     if ref:
-        print(f"参考点  ：{ref}   来源：{ref_src}")
+        emit(f"参考点  ：{ref}   来源：{ref_src}")
     else:
-        print("参考点  ：无（只显示绝对角度；用 --capture 或 --ref 指定后可显示相对角度）")
+        emit("参考点  ：无（只显示绝对角度；用 --capture 或 --ref 指定后可显示相对角度）")
     print()
 
     hdr = "  轴  在线   绝对计数    电机角(°)   关节角(°)  "
     if ref:
         hdr += "│  相对计数   相对电机角(°)  相对关节角(°)"
-    print(hdr)
+    emit(hdr)
     for i in range(3):
         c = counts[i]
         if online[i]:
@@ -232,7 +235,7 @@ def main():
                        "rel_joint_deg": round(rc / DEG2CNT / ratio[i], 4)})
         if not online[i]:
             line += "   ← 离线/读取失败，数值不可信"
-        print(line)
+        emit(line)
         out["axes"].append(ax)
 
     if args.json:

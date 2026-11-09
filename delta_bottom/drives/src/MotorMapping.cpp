@@ -175,6 +175,51 @@ void MotorMapping::loadMotorAddrs(const std::string& path)
 
 // 从 yaml 的 joint.gear_ratio 读三个主动臂减速比（电机角 = 关节角 × 减速比）
 // 读不到就保持默认 1.0，并醒目告警——减速比错了角度会整体差一个倍数，很危险
+// 从 yaml 读每台电机的下发速度/加减速（motors[].speed_rpm / motors[].accel）
+//   speed_rpm：0~6000 RPM（电机轴）；accel：0~200 档位，200 = 最猛，0 = 直接启动（无加减速）
+// 缺字段/越界/非法 → 保留该台默认值（300 RPM / 档位 30），并打印一次告警
+void MotorMapping::loadMotionParams(const std::string& path)
+{
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        for (const auto& m : root["motors"]) {
+            if (!m["addr"]) continue;
+            const int addr = m["addr"].as<int>();
+            if (addr < 1 || addr > 3) continue;
+            const int i = addr - 1;
+
+            if (m["speed_rpm"]) {
+                int v = m["speed_rpm"].as<int>();
+                if (v < 1 || v > 6000) {
+                    std::cerr << "\033[1;31m[警告] motors[" << addr << "].speed_rpm=" << v
+                              << " 越界(1~6000)，该台按 " << g_speed[i] << " RPM 处理\033[0m\n";
+                } else {
+                    g_speed[i] = (uint16_t)v;
+                }
+            }
+            if (m["accel"]) {
+                int v = m["accel"].as<int>();
+                if (v < 0 || v > 200) {
+                    std::cerr << "\033[1;31m[警告] motors[" << addr << "].accel=" << v
+                              << " 越界(0~200)，该台按档位 " << (int)g_accel[i] << " 处理\033[0m\n";
+                } else {
+                    if (v == 0)
+                        std::cerr << "\033[1;33m[提示] motors[" << addr
+                                  << "].accel=0 表示无加减速（直接启停），冲击较大\033[0m\n";
+                    g_accel[i] = (uint8_t)v;
+                }
+            }
+        }
+        std::cerr << "下发参数: ";
+        for (int i = 0; i < 3; ++i)
+            std::cerr << "轴" << (i + 1) << "=" << g_speed[i] << "RPM/档位" << (int)g_accel[i]
+                      << (i < 2 ? "  " : "\n");
+    } catch (const std::exception& e) {
+        std::cerr << "\033[1;31m[警告] 读取 motors[].speed_rpm/accel 失败(" << e.what()
+                  << ")，按默认 300 RPM / 档位 30 处理\033[0m\n";
+    }
+}
+
 // 从 yaml 读三个关节的角度限幅（joint.min_pos / joint.max_pos，单位度）
 // 读不到或数值非法（min >= max）时按 ±180° 处理——等于不限幅，但会醒目告警
 void MotorMapping::loadJointLimits(const std::string& path)

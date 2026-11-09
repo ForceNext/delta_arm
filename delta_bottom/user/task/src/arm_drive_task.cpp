@@ -1,9 +1,9 @@
 #include "arm_drive_task.hpp"
 #include <cmath>
 
-// —— 下发参数 ——
-constexpr uint8_t  MOVE_ACCEL = 200;    // 加减速 r/s²
-constexpr uint16_t MOVE_SPEED = 1000;   // 速度 RPM
+// 下发速度/加减速来自 hardware_config.yaml：
+//   motors[].speed_rpm（0~6000 RPM，电机轴）、motors[].accel（0~200 档位，200 = 最猛，0 = 直接启动）
+// 由 MotorMapping::loadMotionParams() 读入，下发时用 MotorMapping::motorSpeed/motorAccel(轴号-1)。
 
 // 共享内存里的 theta 是什么角度：
 //   true  = 【关节角】，计数 = theta × 减速比 × 51200/360       ← 当前（下发时乘 joint.gear_ratio）
@@ -90,6 +90,7 @@ void ArmDriveTask::init()
     MotorMapping::loadMotorAddrs(hw_cfg_);
     MotorMapping::loadGearRatios(hw_cfg_);
     MotorMapping::loadJointLimits(hw_cfg_);   // joint.min_pos / joint.max_pos
+    MotorMapping::loadMotionParams(hw_cfg_);  // motors[].speed_rpm / accel
 }
 
 // 首次下发前把驱动器准备好：探测 → 初始化（协议 Modbus + 细分 16）→ 使能。
@@ -234,7 +235,9 @@ void ArmDriveTask::run()
         (uint32_t)(int32_t)std::llround(MotorMapping::angleToMotorPos(motor_deg));
 
     // ⑨ 下发绝对位置指令
-    const int rc = MotorMapping::moveAbsoluteRc(master_, id, counts, 0, MOVE_ACCEL, MOVE_SPEED);
+    const int rc = MotorMapping::moveAbsoluteRc(master_, id, counts, 0,
+                                               MotorMapping::motorAccel(i),
+                                               MotorMapping::motorSpeed(i));
     noteResult(id, rc);                               // 在线/离线判定
     if (rc == MB_RC_OK) {
         last_rc_[id - 1] = 0;
