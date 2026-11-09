@@ -81,7 +81,7 @@ sudo ./build/delta_bottom  # 要实时优先级和 /dev/cpu_dma_latency 时需�
 | 文件 | 关键项 |
 | --- | --- |
 | `configs/thread_config.yaml` | `thread_t`（周期秒，当前 0.005 = 200 Hz）、`bind_cpu`、`thread_priority` |
-| `configs/hardware_config.yaml` | `serial`（端口 / 波特率 256000）、`motors`（从站地址 / 细分 / **`speed_rpm` 下发速度 / `accel` 加减速档位**）、`joint.gear_ratio`（三臂减速比）、`joint.min_pos` / `joint.max_pos`（三个关节的角度限幅，度） |
+| `configs/hardware_config.yaml` | `serial`（端口 / 波特率 256000）、`motors`（从站地址 / 细分 / **`speed_rpm` 下发速度 / `accel` 加减速档位**）、`joint.gear_ratio`（三臂减速比）、`joint.dir`（每轴方向系数 +1/-1）、`joint.min_pos` / `joint.max_pos`（三个关节的角度限幅，度） |
 
 ## 工具（`tools/`）
 
@@ -158,8 +158,11 @@ python3 tools/set_angle.py 10 10 10                              # 发布三个�
    - 任何"有应答"的结果（成功 / CRC 错 / 从站异常码）都会清零连续无应答计数——只有真正收不到任何字节才算超时；
 4. **掉线恢复**：已掉线的电机每 **1 s** 轮转重探一台，探测到就置回在线并自动重新纳入下发；
 5. `mode != 1` 视为空闲，不下发；
-6. 每个周期只给**一台**电机发 `moveAbsoluteRc`：**先按 `joint.min_pos` / `joint.max_pos` 限幅** → × 减速比 → 电机计数 → 绝对位置，`1→2→3` 轮转；越限只在"刚被夹住 / 刚松开"时打一行日志（流式下发不会刷屏）。速度和加减速**取自配置** `motors[].speed_rpm` / `motors[].accel`（启动日志会打印 `下发参数: 轴1=50RPM/档位5 …`）；缺失或越界时按 300 RPM / 档位 30 处理并告警；
+6. 每个周期只给**一台**电机发 `moveAbsoluteRc`：**先按 `joint.min_pos` / `joint.max_pos` 限幅** → × 方向系数 `joint.dir` → × 减速比 → 电机计数 → 绝对位置，`1→2→3` 轮转；越限只在"刚被夹住 / 刚松开"时打一行日志（流式下发不会刷屏）。速度和加减速**取自配置** `motors[].speed_rpm` / `motors[].accel`（启动日志会打印 `下发参数: 轴1=50RPM/档位5 …`）；缺失或越界时按 300 RPM / 档位 30 处理并告警；
 7. 下发失败只在"原因变化"时打印一行（否则会刷屏），下一拍轮转时自动重发。
+
+方向系数 `joint.dir`：把「指令的正方向」映射到「机械实际方向」。某个关节转反了就把那一轴改成 `-1`
+（当前三轴都是 `-1`）。`tools/read_angles.py` 会读同一个字段，所以它显示的关节角与指令同号。
 
 速度与加减速的换算：`speed_rpm` 是**电机轴**转速，关节角速度 = `speed_rpm × 6 ÷ 减速比`（50 RPM、减速比 3 → 100 °/s）。
 `accel` 是 **0~200 的档位**（手册 4.4.3），200 = 最猛、0 = 无加减速直接启停。

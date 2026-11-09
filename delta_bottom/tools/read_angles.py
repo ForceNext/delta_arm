@@ -66,6 +66,21 @@ def load_ratio():
     return [3.0, 3.0, 3.0]
 
 
+def load_dir():
+    """joint.dir：每轴方向系数（+1/-1），与底层下发一致，否则显示的关节角符号会相反"""
+    path = os.path.join(HERE, "..", "configs", "hardware_config.yaml")
+    try:
+        txt = open(path, encoding="utf-8").read()
+        m = re.search(r"dir\s*:\s*\n\s*-\s*\[([^\]]+)\]", txt)
+        if m:
+            v = [float(x) for x in m.group(1).split(",")]
+            if len(v) == 3:
+                return [-1.0 if x < 0 else 1.0 for x in v]
+    except Exception as e:
+        print(f"[警告] 读取 joint.dir 失败({e})，按 +1 处理", file=sys.stderr)
+    return [1.0, 1.0, 1.0]
+
+
 # ---------------------------------------------------------------------------
 # 数据来源 1：底层在跑 → 读共享内存（不碰串口）
 # ---------------------------------------------------------------------------
@@ -172,6 +187,7 @@ def main():
         return
 
     ratio = list(args.ratio) if args.ratio else load_ratio()
+    jdir = load_dir()
 
     res = read_from_shm()
     if res is None:
@@ -207,7 +223,9 @@ def main():
     emit = (lambda *a, **k: None) if args.json else print   # --json 时只输出 JSON
 
     emit(f"数据来源：{source}")
-    emit(f"减速比  ：{ratio[0]}, {ratio[1]}, {ratio[2]}    (51200 计数 = 一圈 = 360°)")
+    emit(f"减速比  ：{ratio[0]}, {ratio[1]}, {ratio[2]}    "
+         f"方向系数：{int(jdir[0]):+d}, {int(jdir[1]):+d}, {int(jdir[2]):+d}    "
+         f"(51200 计数 = 一圈 = 360°)")
     if ref:
         emit(f"参考点  ：{ref}   来源：{ref_src}")
     else:
@@ -221,18 +239,19 @@ def main():
     for i in range(3):
         c = counts[i]
         if online[i]:
-            line = (f"  {i+1}   是   {c:9d}   {c / DEG2CNT:10.3f}   {c / DEG2CNT / ratio[i]:9.3f}  ")
+            line = (f"  {i+1}   是   {c:9d}   {c / DEG2CNT:10.3f}   "
+                    f"{jdir[i] * c / DEG2CNT / ratio[i]:9.3f}  ")
         else:                                  # 读失败：显示 -- 而不是 0，避免误解
             line = f"  {i+1}   否         --          --           --  "
         ax = {"axis": i + 1, "online": online[i], "counts": c,
               "motor_deg": round(c / DEG2CNT, 4),
-              "joint_deg": round(c / DEG2CNT / ratio[i], 4)}
+              "joint_deg": round(jdir[i] * c / DEG2CNT / ratio[i], 4)}
         if ref:
             rc = c - ref[i]
             line += (f"│  {rc:9d}   {rc / DEG2CNT:12.3f}   "
-                     f"{rc / DEG2CNT / ratio[i]:12.3f}")
+                     f"{jdir[i] * rc / DEG2CNT / ratio[i]:12.3f}")
             ax.update({"rel_counts": rc, "rel_motor_deg": round(rc / DEG2CNT, 4),
-                       "rel_joint_deg": round(rc / DEG2CNT / ratio[i], 4)})
+                       "rel_joint_deg": round(jdir[i] * rc / DEG2CNT / ratio[i], 4)})
         if not online[i]:
             line += "   ← 离线/读取失败，数值不可信"
         emit(line)

@@ -220,6 +220,26 @@ void MotorMapping::loadMotionParams(const std::string& path)
     }
 }
 
+// 从 yaml 读每轴方向系数（joint.dir，+1/-1）
+// 作用：把「指令里的正方向」映射到「机械实际方向」。某个关节反了就把那一轴改成 -1。
+void MotorMapping::loadJointDirs(const std::string& path)
+{
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        auto d = root["joint"]["dir"][0];       // [d1, d2, d3]
+        for (int i = 0; i < 3; ++i) {
+            double v = d[i].as<double>();
+            g_joint_dir[i] = (v < 0.0) ? -1.0 : 1.0;
+        }
+        std::cerr << "关节方向: " << (g_joint_dir[0] < 0 ? "-1" : "+1") << ", "
+                  << (g_joint_dir[1] < 0 ? "-1" : "+1") << ", "
+                  << (g_joint_dir[2] < 0 ? "-1" : "+1") << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "\033[1;31m[警告] 读取 joint.dir 失败(" << e.what()
+                  << ")，三轴都按 +1 处理\033[0m\n";
+    }
+}
+
 // 从 yaml 读三个关节的角度限幅（joint.min_pos / joint.max_pos，单位度）
 // 读不到或数值非法（min >= max）时按 ±180° 处理——等于不限幅，但会醒目告警
 void MotorMapping::loadJointLimits(const std::string& path)
