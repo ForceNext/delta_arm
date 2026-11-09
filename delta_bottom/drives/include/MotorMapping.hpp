@@ -47,6 +47,18 @@ public:
     static void loadGearRatios(const std::string& path);
     static double gearRatio(int i) { return g_gear[i]; }  // 下标 0~2 = 电机号-1
 
+    // 从 yaml 的 joint.min_pos / joint.max_pos 读三个关节的限幅（单位：度，关节角）
+    // 读不到/非法时按 ±180° 处理（等于不限幅），并打印醒目告警
+    static void loadJointLimits(const std::string& path);
+    static double minJointAngle(int i) { return g_joint_min[i]; }
+    static double maxJointAngle(int i) { return g_joint_max[i]; }
+    // 把关节角夹到 [min, max]，返回夹取后的值
+    static double clampJointAngle(int i, double angle) {
+        if (angle < g_joint_min[i]) return g_joint_min[i];
+        if (angle > g_joint_max[i]) return g_joint_max[i];
+        return angle;
+    }
+
     // 在线状态 / 失败计数访问（供控制循环使用）
     static uint64_t (&errs())[3] { return g_err; }        // 每台累计失败次数（下标 = 地址-1）
 
@@ -101,6 +113,8 @@ private:
     static inline uint64_t g_err[3] = {0, 0, 0};                // 每台累计失败次数（下标 = 地址-1）
     static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
     static inline double g_gear[3] = {1.0, 1.0, 1.0};           // 三个主动臂减速比（下标 = 电机号-1）
+    static inline double g_joint_min[3] = {-180.0, -180.0, -180.0};  // 关节角下限（度）
+    static inline double g_joint_max[3] = { 180.0,  180.0,  180.0};  // 关节角上限（度）
 };
 
 #endif // MOTOR_MAPPING_HPP

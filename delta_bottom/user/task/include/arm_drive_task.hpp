@@ -39,7 +39,8 @@ private:
     uint32_t probe_tick_ = 0;              // 探测节拍计数（每 PROBE_PERIOD 拍探一台）
     int last_rc_[3] = {0, 0, 0};           // 每台上次失败原因（只在变化时打印，避免刷屏）
     uint32_t consec_timeout_[3] = {0, 0, 0};   // 每台连续"无应答"次数
-    uint32_t offline_probe_tick_ = 0;      // 离线重探节拍计数（每 OFFLINE_REPROBE_PERIOD 拍探一台）
+    uint32_t offline_probe_tick_ = 0;      // 离线重探节拍计数
+    int8_t clamp_state_[3] = {0, 0, 0};    // 每台限幅状态：0=未夹 -1=被下限夹 +1=被上限夹（只用于日志去重）（每 OFFLINE_REPROBE_PERIOD 拍探一台）
 
     // 探测 → 初始化 → 使能；全部完成返回 true
     bool ensureDrivesReady();

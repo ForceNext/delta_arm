@@ -175,6 +175,35 @@ void MotorMapping::loadMotorAddrs(const std::string& path)
 
 // 从 yaml 的 joint.gear_ratio 读三个主动臂减速比（电机角 = 关节角 × 减速比）
 // 读不到就保持默认 1.0，并醒目告警——减速比错了角度会整体差一个倍数，很危险
+// 从 yaml 读三个关节的角度限幅（joint.min_pos / joint.max_pos，单位度）
+// 读不到或数值非法（min >= max）时按 ±180° 处理——等于不限幅，但会醒目告警
+void MotorMapping::loadJointLimits(const std::string& path)
+{
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        auto mn = root["joint"]["min_pos"][0];   // [min1, min2, min3]
+        auto mx = root["joint"]["max_pos"][0];   // [max1, max2, max3]
+        for (int i = 0; i < 3; ++i) {
+            double lo = mn[i].as<double>();
+            double hi = mx[i].as<double>();
+            if (!(lo < hi)) {
+                std::cerr << "\033[1;31m[警告] joint 限幅[" << i << "] 非法（min=" << lo
+                          << " >= max=" << hi << "），该轴按 ±180° 处理（等于不限幅）\033[0m\n";
+                lo = -180.0;
+                hi = 180.0;
+            }
+            g_joint_min[i] = lo;
+            g_joint_max[i] = hi;
+        }
+        std::cerr << "关节限幅: [" << g_joint_min[0] << ", " << g_joint_max[0] << "] ["
+                  << g_joint_min[1] << ", " << g_joint_max[1] << "] ["
+                  << g_joint_min[2] << ", " << g_joint_max[2] << "]\n";
+    } catch (const std::exception& e) {
+        std::cerr << "\033[1;31m[警告] 读取 joint.min_pos/max_pos 失败(" << e.what()
+                  << ")，关节角按 ±180° 处理（等于不限幅），请检查 hardware_config.yaml\033[0m\n";
+    }
+}
+
 void MotorMapping::loadGearRatios(const std::string& path)
 {
     try {

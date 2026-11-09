@@ -81,7 +81,7 @@ sudo ./build/delta_bottom  # 要实时优先级和 /dev/cpu_dma_latency 时需�
 | 文件 | 关键项 |
 | --- | --- |
 | `configs/thread_config.yaml` | `thread_t`（周期秒，当前 0.005 = 200 Hz）、`bind_cpu`、`thread_priority` |
-| `configs/hardware_config.yaml` | `serial`（端口 / 波特率 256000）、`motors`（从站地址）、`joint.gear_ratio`（三臂减速比） |
+| `configs/hardware_config.yaml` | `serial`（端口 / 波特率 256000）、`motors`（从站地址 / 细分）、`joint.gear_ratio`（三臂减速比）、`joint.min_pos` / `joint.max_pos`（三个关节的角度限幅，度） |
 
 ## 工具（`tools/`）
 
@@ -90,6 +90,7 @@ sudo ./build/delta_bottom  # 要实时优先级和 /dev/cpu_dma_latency 时需�
 | `probe_bus.py` | 总线探测/排障：地址扫描、成功率、只听不发、`--raw` 注入任意帧（内置模式只发 `04H` 读，不会让电机动作） |
 | `read_angles.py` | **只读**打印三台角度；自动选数据源（底层在跑读共享内存，没跑则直连串口），避免两个主站抢总线；`--capture/--ref` 可显示相对角度 |
 | `set_angle.py` | 向共享内存写三个角度（`--idle` 置空闲）；带"不拿陈旧/零基准"的护栏 |
+| `set_zero.py` | **以当前位置为零点**（驱动器 `0xF8` 清零）：直接运行即可，读当前 → 清零三台 → 复核；`--dry-run` 只读不发、`--axis` 选轴、`--ask` 才询问；底层在跑时拒绝执行 |
 | `testpy.py` | 串口直连调试（读版本/位置/转速/状态），参数写死，需要 `pyserial` |
 | `docs/` | PDxxS1 用户手册、Modbus 协议表、机构简图 |
 
@@ -122,7 +123,16 @@ python3 tools/set_angle.py 10 10 10                              # 发布三个�
 驱动器返回的是**它自己的绝对计数**，和「θ=0 = 上臂水平」没有关系。不标定就发绝对角度，机械臂会大幅乱动。
 
 1. 人工把机械臂摆到参考位形（例如三个上臂水平）；
-2. 三台各发一帧位置清零 `0xF8`（`06H` 写 `0x00F8` = 1）：
+2. 清零三台的位置计数器（先停掉 `delta_bottom`，一根 RS485 只能一个主站）：
+
+   ```bash
+   cd delta_bottom
+   python3 tools/set_zero.py             # 直接清零三台（以当前位置为零点）
+   python3 tools/set_zero.py --dry-run   # 只看当前计数和要发的帧（不写）
+   python3 tools/set_zero.py --axis 1    # 只清 1 号
+   ```
+
+   等价的原始帧（`06H` 写 `0x00F8` = 1，可用 `probe_bus.py --raw` 发）：
 
    ```
    01 06 00 F8 00 01 C9 FB
@@ -148,7 +158,11 @@ python3 tools/set_angle.py 10 10 10                              # 发布三个�
    - 任何"有应答"的结果（成功 / CRC 错 / 从站异常码）都会清零连续无应答计数——只有真正收不到任何字节才算超时；
 4. **掉线恢复**：已掉线的电机每 **1 s** 轮转重探一台，探测到就置回在线并自动重新纳入下发；
 5. `mode != 1` 视为空闲，不下发；
-6. 每个周期只给**一台**电机发 `moveAbsoluteRc`：角度 → 电机计数 → 绝对位置，`1→2→3` 轮转；
+6. 每个周期只给**一台**电机发 `moveAbsoluteRc`：**先按 `joint.min_pos` / `joint.max_pos` 限幅** → × 减速比 → 电机计数 → 绝对位置，`1→2→3` 轮转；越限只在"刚被夹住 / 刚松开"时打一行日志（流式下发不会刷屏）；
 7. 下发失败只在"原因变化"时打印一行（否则会刷屏），下一拍轮转时自动重发。
+
+限幅规则：`joint.min_pos` / `joint.max_pos` 是对**关节角**的约束（当前 `theta` 就是关节角），例如
+`[-30, 60]` → 上位机写 102° 实际只下发 60°（电机 180°、25600 计数）。配置读不到或 `min >= max` 时
+该轴按 ±180°（等于不限幅）处理，并打印红色告警。
 
 待补充：回读实测位置并发布 `ArmStatus`（`theta/motor_pos/joint_theta` 现在恒为 0）、`0xF9/0xFB` 错误状态清除与校验。

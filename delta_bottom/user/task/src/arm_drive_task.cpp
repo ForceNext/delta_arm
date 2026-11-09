@@ -77,6 +77,7 @@ void ArmDriveTask::init()
     drives_ready_ = false;
     offline_probe_tick_ = 0;
     consec_timeout_[0] = consec_timeout_[1] = consec_timeout_[2] = 0;
+    clamp_state_[0] = clamp_state_[1] = clamp_state_[2] = 0;
     next_motor_ = 1;
     next_probe_ = 1;
     probe_tick_ = 0;
@@ -88,6 +89,7 @@ void ArmDriveTask::init()
     // 串口 + 电机地址 + 减速比
     MotorMapping::loadMotorAddrs(hw_cfg_);
     MotorMapping::loadGearRatios(hw_cfg_);
+    MotorMapping::loadJointLimits(hw_cfg_);   // joint.min_pos / joint.max_pos
 }
 
 // 首次下发前把驱动器准备好：探测 → 初始化（协议 Modbus + 细分 16）→ 使能。
@@ -196,14 +198,42 @@ void ArmDriveTask::run()
     next_motor_ = (next_motor_ % 3) + 1;
     if (!MotorMapping::isOnline(id)) return;
 
-    // ⑦ 角度 → 电机计数。用 int32 中转再转 uint32，负角度按补码编码（驱动器位置是 int32）
+    // ⑦ 关节角限幅：超出 joint.min_pos / joint.max_pos 就夹到边界（每次下发前都检查）
+    const int i = id - 1;
+    const double req = cmd.theta[i];                              // 上位机请求的角度
+    if (!std::isfinite(req)) {                                    // NaN/Inf：本拍跳过，免得 llround 出未定义值
+        if (clamp_state_[i] != 2) {
+            clamp_state_[i] = 2;
+            printf_color(PrintColor::Red,
+                         "[DriveTask] 电机 %d 收到非法角度（NaN/Inf），已跳过下发\n", id);
+        }
+        return;
+    }
+    if (clamp_state_[i] == 2) clamp_state_[i] = 0;                 // 恢复正常数值
+    const double lo = MotorMapping::minJointAngle(i);
+    const double hi = MotorMapping::maxJointAngle(i);
+    const double theta = MotorMapping::clampJointAngle(i, req);    // 实际下发的角度
+    const int8_t side = (req < lo) ? -1 : ((req > hi) ? 1 : 0);    // 只在状态变化时打印，避免刷屏
+    if (side != clamp_state_[i]) {
+        clamp_state_[i] = side;
+        if (side != 0) {
+            printf_color(PrintColor::Yellow,
+                         "[DriveTask] 电机 %d 目标 %.2f° 超出限幅 [%.1f, %.1f]，已夹到 %.2f°\n",
+                         id, req, lo, hi, theta);
+        } else {
+            printf_color(PrintColor::Green,
+                         "[DriveTask] 电机 %d 目标回到限幅内（%.2f°）\n", id, theta);
+        }
+    }
+
+    // ⑧ 角度 → 电机计数。用 int32 中转再转 uint32，负角度按补码编码（驱动器位置是 int32）
     const double motor_deg = THETA_IS_JOINT_ANGLE
-                                 ? cmd.theta[id - 1] * MotorMapping::gearRatio(id - 1)
-                                 : cmd.theta[id - 1];
+                                 ? theta * MotorMapping::gearRatio(i)
+                                 : theta;
     const uint32_t counts =
         (uint32_t)(int32_t)std::llround(MotorMapping::angleToMotorPos(motor_deg));
 
-    // ⑧ 下发绝对位置指令
+    // ⑨ 下发绝对位置指令
     const int rc = MotorMapping::moveAbsoluteRc(master_, id, counts, 0, MOVE_ACCEL, MOVE_SPEED);
     noteResult(id, rc);                               // 在线/离线判定
     if (rc == MB_RC_OK) {
