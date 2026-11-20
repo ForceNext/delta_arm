@@ -1,8 +1,15 @@
 # delta_arm — Delta 并联机械臂
 
 Linux 下用 **Modbus RTU**（RS485 / USB 转串口）控制 3 台 **正点原子 PDxxS1 闭环步进驱动器**。
-上位机通过**共享内存**下发三个**关节角**，底层负责「关节角 → 电机计数 → 总线下发」。
-**坐标正逆解在上位机**，本工程不含 IK/FK。
+上位机（`ros2_ws/` 里的 ROS 2 节点）负责**坐标正逆解**，通过共享内存把三个**关节角**交给底层；
+底层 `delta_bottom` 只负责「关节角 → 电机计数 → 总线下发」。
+
+```
+末端目标 (x,y,z)  ──ROS 2 topic──▶  ros2_ws/Kinematics  ──逆解──▶  θ(关节角)
+                                                                      │ 共享内存 /delta_arm
+                                                                      ▼
+                           电机 ◀──0xF2 绝对位置──  delta_bottom（限幅→偏置→方向→减速比→计数）
+```
 
 ---
 
@@ -19,12 +26,15 @@ Linux 下用 **Modbus RTU**（RS485 / USB 转串口）控制 3 台 **正点原�
 | 关节角限幅 / 方向系数 / 速度加减速 | ✅ 全部读配置 |
 | 在线判定（连续 10 次超时→专门探测）与掉线恢复（每秒重探） | ✅ 可用 |
 | 实测位置回读（`ArmStatus.theta/motor_pos/joint_theta`） | ⬜ **未实现**（现在恒为 0） |
+| ROS 2 逆解节点（`ros2_ws/src/Kinematics`：订阅 xyz → 逆解 → 写共享内存） | ✅ 可用 |
 
 ## 目录结构
 
 ```
 delta_arm/
 ├── README.md
+├── ros2_ws/                          # 上位机侧（ROS 2 Jazzy 工作区，做逆解/轨迹）
+│   └── src/Kinematics/               #   订阅 (x,y,z) → 闭式逆解 → 写共享内存
 └── delta_bottom/                     # 下位机工程（产物 build/delta_bottom）
     ├── build.sh                      # 一键编译：./build.sh [--clean|--debug|--run]
     ├── CMakeLists.txt                # 顶层构建（common / drives / user/task）
@@ -62,10 +72,68 @@ sudo ./build/delta_bottom  # 实时优先级与 /dev/cpu_dma_latency 需要 root
 | `joint.gear_ratio` | 三个主动臂减速比（电机角 = 关节角 × 减速比） |
 | `joint.dir` | 每轴方向系数 `+1/-1`，用于匹配机械安装方向（某轴转反了就改这一轴） |
 | `joint.offset` | 每轴**关节零位偏置**（度）：`关节角 = dir × 计数/(51200/360) ÷ 减速比 + offset`；用于把某个物理姿态标定成指定关节角 |
-| `joint.min_pos` / `joint.max_pos` | 三个关节的**角度限幅**（度），每次下发前夹取 |
+| `joint.min_pos` / `joint.max_pos` | 三个关节的**角度限幅**（度），每次下发前夹取。当前 `[-25] / [35]`：对应竖直方向 `z ≈ 138.5 / 300.8 mm`（向下为正，`35°` 就是最深位置） |
 
 缺失/非法时的回落：`speed_rpm`→300 RPM、`accel`→档位 30、`gear_ratio`→1.0、`dir`→+1、限幅→±180°，
 全部会打印醒目告警；启动日志会回显 `减速比 / 关节方向 / 关节限幅 / 下发参数` 便于核对。
+
+## 上位机 ROS 2 包（`ros2_ws/src/Kinematics`）
+
+订阅末端目标点，做闭式逆解，把关节角写进共享内存。
+
+```bash
+cd ros2_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select Kinematics
+source install/setup.bash
+ros2 run Kinematics kinematics_node          # 默认订阅 /delta_arm/target_xyz
+# 另一个终端发目标（mm，**z 向下为正**：z=186 ≈ 上臂水平，越大越深；规定 z ∈ [138, 300]）
+ros2 topic pub --once /delta_arm/target_xyz geometry_msgs/msg/Point "{x: 0.0, y: 0.0, z: 250.0}"
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+**话题接口（只用话题，不用服务）**
+
+| 方向 | 话题 | 类型 | 单位/说明 |
+| --- | --- | --- | --- |
+| 输入 | `/delta_arm/target_xyz` | `geometry_msgs/Point` | mm，**z 向下为正**，规定 `z ∈ [138, 300]` |
+| 输出 | `/delta_arm/joint_states` | `sensor_msgs/JointState` | **rad**（ROS 标准），`name = joint1/2/3`；这是夹取后实际下发的角度 |
+| 输出 | `/delta_arm/actual_xyz` | `geometry_msgs/Point` | mm，夹取后正解得到的落点（和请求值一比就知道差多少） |
+
+```bash
+ros2 topic echo /delta_arm/joint_states      # 看逆解结果（弧度）
+ros2 topic echo /delta_arm/actual_xyz        # 看实际落点
+ros2 topic list | grep delta_arm             # 三个话题
+ros2 topic pub -r 20 /delta_arm/target_xyz geometry_msgs/msg/Point "{x: 0.0, y: 0.0, z: 250.0}"
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `d1/L1/L2/d2` | 115 / 150 / 292 / 40 | 机构几何（mm），对应旧配置的 `joint.jointlength` |
+| `joint_min` / `joint_max` | `[-25,-25,-25]` / `[35,35,35]` | 关节角限幅（度），**必须与 `hardware_config.yaml` 一致**。竖直方向：`θ=-25° → z=138.512`、`θ=0° → z=186.116`、`θ=+35° → z=300.770` mm |
+| `z_min` / `z_max` | **`138.0` / `300.0`** | z 范围守卫（mm，**z 向下为正**）：**规定 z ∈ [138, 300]**，超出即丢弃目标。`-p z_min:=…` / `-p z_max:=…` 可改 |
+| `reach_tol_mm` | 1.0 | 关节角被夹取后回代正解，与请求点偏差超过该值即判定"超出可达空间"并丢弃目标 |
+| `xyz_topic` | `/delta_arm/target_xyz` | 目标点话题（`geometry_msgs/Point`） |
+| `joint_state_topic` | `/delta_arm/joint_states` | 输出：关节角（`sensor_msgs/JointState`，弧度） |
+| `actual_xyz_topic` | `/delta_arm/actual_xyz` | 输出：夹取后正解落点（`geometry_msgs/Point`，mm） |
+| `shm_name` / `sem_key` | `/delta_arm` / `0x5A11` | 与底层一致 |
+| `dry_run` | false | true 时只算不写（调试/校核用） |
+| `timeout_s` | 0（关闭） | >0：超过这么久没收到目标就写 `mode=0` |
+| `self_check` | true | 首次收到目标时做一次 FK(IK(xyz)) 残差自检并打日志 |
+
+```bash
+# 传参示例：改几何 + 只算不写
+ros2 run Kinematics kinematics_node --ros-args -p dry_run:=true -p L2:=290.0
+```
+
+要点：
+- **逆解输出就是共享内存里的 `theta`（关节角，度）**，减速比/方向/零位偏置都由底层按 `hardware_config.yaml` 处理，本节点不做这些换算；
+- **坐标/角度约定**：`z` 向上为正（动平台在基座下方为负）；`θ=0` = 上臂水平朝外，`θ>0` 下压；三臂方位角 0°/120°/240°；
+- **不可达不写**：逆解失败（含"判别式合法但代回正解回不到原点"的假解）时保持上一次有效目标，只打限频告警；
+- **坐标约定**：`x` 指向 1 号臂，`y` 与它成右手系，**`z` 向下为正**（z=0 在肩关节轴线平面，动平台在下方 → z 为正值）；三臂方位角 0°/120°/240°；`θ=0` 上臂水平，`θ>0` 下压。
+- **工作空间守卫**（三层）：① IK 自洽校验（代回正解必须回到请求点）；② 关节角限幅后**再回代正解**，若到不了请求点（偏差 > `reach_tol_mm`）就丢弃——避免"夹过的角度"变成另一个错误落点；③ z 范围守卫（**规定 `z ∈ [138, 300]`**）。启动日志会打印参考点，例如 `z(θ=-25°)=138.512  z(θ=0°)=186.116  z(θ=+35°)=300.770 mm`；
+- **零点一致性**：`θ` 与底层 `joint.offset` 是同一套坐标，标定见 `tools/calib_offset.py`。
 
 ## 控制循环（`ArmDriveTask::run()`）
 

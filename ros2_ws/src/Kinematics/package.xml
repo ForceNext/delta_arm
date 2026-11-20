@@ -3,13 +3,15 @@
 <package format="3">
   <name>Kinematics</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Delta 并联机械臂逆解：订阅末端 (x,y,z)，解算关节角并通过共享内存 /delta_arm 下发给 delta_bottom</description>
   <maintainer email="hjslyx00@163.com">cat</maintainer>
-  <license>TODO: License declaration</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
