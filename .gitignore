@@ -1,5 +1,27 @@
-# 编辑器配置（VSCode 本地设置，不应入库）
+# —— 编辑器 / 本地状态（不应入库）——
 .vscode/
-
-# 本地运行状态（read_angles.py 的参考点）
 delta_bottom/tools/.angle_ref.json
+
+# —— ROS 2 / colcon 工作区编译产物（只保留 src/，产物不入库）——
+# 放在根级，ros2_ws/ 以及以后新建的 colcon 工作区都覆盖；
+# 已确认仓库里没有名为 build/ install/ log/ 的源码目录（build.sh 不受影响：规则带斜杠只匹配目录）
+build/
+install/
+log/
+
+# colcon 的缓存与安装记录
+.colcon/
+*.colcon.meta
+install/.colcon_install_layout
+
+# —— Python 运行时缓存（tools/*.py 和 ROS 2 Python 节点都会产生）——
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# —— 编译产物杂项 ——
+*.o
+*.a
+*.so
+*.so.*
+compile_commands.json

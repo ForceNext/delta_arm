@@ -61,6 +61,7 @@ sudo ./build/delta_bottom  # 实时优先级与 /dev/cpu_dma_latency 需要 root
 | `motors[].accel` | 加减速**档位** 0~200（手册 4.4.3）：200 最猛，0 = 无加减速直接启停 |
 | `joint.gear_ratio` | 三个主动臂减速比（电机角 = 关节角 × 减速比） |
 | `joint.dir` | 每轴方向系数 `+1/-1`，用于匹配机械安装方向（某轴转反了就改这一轴） |
+| `joint.offset` | 每轴**关节零位偏置**（度）：`关节角 = dir × 计数/(51200/360) ÷ 减速比 + offset`；用于把某个物理姿态标定成指定关节角 |
 | `joint.min_pos` / `joint.max_pos` | 三个关节的**角度限幅**（度），每次下发前夹取 |
 
 缺失/非法时的回落：`speed_rpm`→300 RPM、`accel`→档位 30、`gear_ratio`→1.0、`dir`→+1、限幅→±180°，
@@ -75,7 +76,7 @@ sudo ./build/delta_bottom  # 实时优先级与 /dev/cpu_dma_latency 需要 root
 5. 已判定掉线的电机：每 1 s 轮转重探一台，通了自动重新纳入下发；
 6. `mode != 1` 视为空闲，不下发；
 7. 每拍只给**一台**电机下发，`1→2→3` 轮转（`thread_t=4ms` → 每台约 83 Hz）；
-8. 每个轴下发前：**NaN/Inf 检查** → **关节角限幅** → **× `joint.dir`** → **× `joint.gear_ratio`** → 计数（负角度按 int32 补码）→ `0xF2` 绝对位置（速度/加减速取自配置）；
+8. 每个轴下发前：**NaN/Inf 检查** → **关节角限幅** → **减 `joint.offset`** → **× `joint.dir`** → **× `joint.gear_ratio`** → 计数（负角度按 int32 补码）→ `0xF2` 绝对位置（速度/加减速取自配置）；
 9. 在线判定：某台**连续 10 次无应答**（约 150 ms）时单独探一次——有应答就继续、无应答判掉线（`online[i]=0`，跳过该轴）；CRC 错 / 从站异常码算"有应答"，不计入掉线。
 
 日志只在状态变化时打印（限幅被触发/解除、失败原因变化、掉线/恢复），流式下发不会刷屏。
@@ -114,6 +115,7 @@ struct ArmStatus {           // 底层 → 上位机
 | `probe_bus.py` | 总线探测/排障：地址扫描、成功率、只听不发、`--raw` 注入任意帧（内置模式只发 `04H` 读，不会让电机动作） |
 | `read_angles.py` | **只读**打印三台角度：自动选数据源（底层在跑读共享内存，没跑则直连串口）、CRC 校验 + 重试、应用 `joint.dir`；`--capture/--ref` 显示相对角度、`--json` 纯 JSON、`--dev` 指定串口 |
 | `set_angle.py` | 向共享内存写三个关节角（`--idle` 置空闲、`--unit joint\|motor`、`--hint-jump` 只提示）；底层没在运行时拒绝写入 |
+| `calib_offset.py` | **关节零位偏置标定**：按"当前姿态 → 指定关节角"算出 `joint.offset`（`--write` 写回配置、`--counts` 可离线算） |
 | `set_zero.py` | **以当前位置为零点**（驱动器 `0xF8`）：直接运行即可；`--dry-run` 只读、`--axis` 选轴、`--ask` 才询问；底层在跑时拒绝 |
 | `testpy.py` | 串口直连调试（读版本/位置/转速/状态），参数写死，需要 `pyserial` |
 | `docs/` | PDxxS1 用户手册、Modbus 协议表、机构简图 |
@@ -161,6 +163,16 @@ python3 tools/set_zero.py                                        # 以当前位�
 ```
 
 > 这类驱动器**不是掉电记忆**的：重新上电后计数会回到 0，需要重新标定，或用 `0x91/0x92` 做回零。
+
+**另一种标定方式（不改驱动器计数）**：用软件偏置把某个物理姿态定义成任意关节角，例如让当前姿态等于 35°/35°/35°：
+
+```bash
+python3 tools/calib_offset.py 35 35 35            # 只算，不改文件
+python3 tools/calib_offset.py 35 35 35 --write    # 写回 hardware_config.yaml（备份 .bak）
+```
+
+原理：`offset = θ_target − dir × 计数 ÷ (51200/360) ÷ 减速比`，然后底层下发时用 `计数 = dir × (θ − offset) × 减速比 × (51200/360)`。
+`joint.offset` 与 `set_zero.py`（改计数零点）是**两套机制，不要混用**：清零后读数会等于 `offset`。
 
 ## 已知问题（实测）
 

@@ -167,6 +167,21 @@ def read_from_serial(trials=5, dev=None):
 
 
 # ---------------------------------------------------------------------------
+def load_offset():
+    """joint.offset：每轴零位偏置（度），与底层一致；关节角 = dir×计数/(51200/360)/减速比 + offset"""
+    path = os.path.join(HERE, "..", "configs", "hardware_config.yaml")
+    try:
+        txt = open(path, encoding="utf-8").read()
+        m = re.search(r"offset\s*:\s*\n\s*-\s*\[([^\]]+)\]", txt)
+        if m:
+            v = [float(x) for x in m.group(1).split(",")]
+            if len(v) == 3:
+                return v
+    except Exception as e:
+        print(f"[警告] 读取 joint.offset 失败({e})，按 0 处理", file=sys.stderr)
+    return [0.0, 0.0, 0.0]
+
+
 def main():
     ap = argparse.ArgumentParser(description="读取三台电机角度（只读）")
     ap.add_argument("--capture", action="store_true", help="把当前计数记为参考点并保存")
@@ -188,6 +203,7 @@ def main():
 
     ratio = list(args.ratio) if args.ratio else load_ratio()
     jdir = load_dir()
+    joff = load_offset()
 
     res = read_from_shm()
     if res is None:
@@ -240,12 +256,12 @@ def main():
         c = counts[i]
         if online[i]:
             line = (f"  {i+1}   是   {c:9d}   {c / DEG2CNT:10.3f}   "
-                    f"{jdir[i] * c / DEG2CNT / ratio[i]:9.3f}  ")
+                    f"{jdir[i] * c / DEG2CNT / ratio[i] + joff[i]:9.3f}  ")
         else:                                  # 读失败：显示 -- 而不是 0，避免误解
             line = f"  {i+1}   否         --          --           --  "
         ax = {"axis": i + 1, "online": online[i], "counts": c,
               "motor_deg": round(c / DEG2CNT, 4),
-              "joint_deg": round(jdir[i] * c / DEG2CNT / ratio[i], 4)}
+              "joint_deg": round(jdir[i] * c / DEG2CNT / ratio[i] + joff[i], 4)}
         if ref:
             rc = c - ref[i]
             line += (f"│  {rc:9d}   {rc / DEG2CNT:12.3f}   "

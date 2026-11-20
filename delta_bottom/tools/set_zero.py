@@ -168,6 +168,11 @@ def main():
             bad = "   ← 没清干净？"
         print(f"  轴{i+1}: {after[i]:8d} 计数  {after[i]/DEG2CNT:9.3f}° 电机角  "
               f"{after[i]/DEG2CNT/3.0:9.3f}° 关节角{tag}{bad}")
+
+    joff = ra.load_offset()
+    if any(abs(x) > 1e-9 for x in joff):
+        print(f"\n[提示] joint.offset 非 0（{joff}），所以清零后关节角读数会等于 offset 而不一定是 0。\n"
+              f"       想让某个姿态对应指定角度，用 tools/calib_offset.py 设 offset（不要两套混用）。")
     return 0 if ok_all else 1
 
 

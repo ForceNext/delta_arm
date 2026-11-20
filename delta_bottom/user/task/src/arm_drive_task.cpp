@@ -91,6 +91,7 @@ void ArmDriveTask::init()
     MotorMapping::loadGearRatios(hw_cfg_);
     MotorMapping::loadJointLimits(hw_cfg_);   // joint.min_pos / joint.max_pos
     MotorMapping::loadJointDirs(hw_cfg_);     // joint.dir（每轴 +1/-1）
+    MotorMapping::loadJointOffsets(hw_cfg_);  // joint.offset（每轴零位偏置，度）
     MotorMapping::loadMotionParams(hw_cfg_);  // motors[].speed_rpm / accel
 }
 
@@ -229,10 +230,12 @@ void ArmDriveTask::run()
     }
 
     // ⑧ 角度 → 电机计数。用 int32 中转再转 uint32，负角度按补码编码（驱动器位置是 int32）
-    //    关节角模式下先乘方向系数（joint.dir，+1/-1）再乘减速比
-    const double motor_deg = THETA_IS_JOINT_ANGLE
-                                 ? theta * MotorMapping::jointDir(i) * MotorMapping::gearRatio(i)
-                                 : theta;
+    //    关节角模式：先减零位偏置 joint.offset，再乘方向系数 joint.dir，再乘减速比
+    const double motor_deg =
+        THETA_IS_JOINT_ANGLE
+            ? (theta - MotorMapping::jointOffset(i)) * MotorMapping::jointDir(i) *
+                  MotorMapping::gearRatio(i)
+            : theta;
     const uint32_t counts =
         (uint32_t)(int32_t)std::llround(MotorMapping::angleToMotorPos(motor_deg));
 

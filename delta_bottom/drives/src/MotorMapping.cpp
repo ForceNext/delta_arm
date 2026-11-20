@@ -240,6 +240,22 @@ void MotorMapping::loadJointDirs(const std::string& path)
     }
 }
 
+// 从 yaml 读每轴关节零位偏置（joint.offset，度）
+// 作用：把"驱动器计数"对齐到"关节角"的零点/参考值，例如把当前姿态标定为 35°/35°/35°。
+void MotorMapping::loadJointOffsets(const std::string& path)
+{
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        auto o = root["joint"]["offset"][0];     // [o1, o2, o3]
+        for (int i = 0; i < 3; ++i) g_joint_offset[i] = o[i].as<double>();
+        std::cerr << "关节偏置: " << g_joint_offset[0] << ", " << g_joint_offset[1] << ", "
+                  << g_joint_offset[2] << " 度\n";
+    } catch (const std::exception& e) {
+        std::cerr << "\033[1;33m[提示] 未读到 joint.offset（" << e.what()
+                  << "），三轴按 0 处理\033[0m\n";
+    }
+}
+
 // 从 yaml 读三个关节的角度限幅（joint.min_pos / joint.max_pos，单位度）
 // 读不到或数值非法（min >= max）时按 ±180° 处理——等于不限幅，但会醒目告警
 void MotorMapping::loadJointLimits(const std::string& path)

@@ -60,6 +60,12 @@ public:
     static void loadJointDirs(const std::string& path);
     static double jointDir(int i) { return g_joint_dir[i]; }   // 下标 0~2 = 电机号-1
 
+    // 从 yaml 的 joint.offset 读每轴零位偏置（度）：
+    //   关节角 = dir × 计数/(51200/360) ÷ 减速比 + offset
+    //   下发时反过来：计数 = dir × (关节角 − offset) × 减速比 × (51200/360)
+    static void loadJointOffsets(const std::string& path);
+    static double jointOffset(int i) { return g_joint_offset[i]; }
+
     static void loadJointLimits(const std::string& path);
     static double minJointAngle(int i) { return g_joint_min[i]; }
     static double maxJointAngle(int i) { return g_joint_max[i]; }
@@ -127,6 +133,7 @@ private:
     static inline bool g_online[3] = {false, false, false};     // 运行时在线状态（下标 = 地址-1）
     static inline double g_gear[3] = {1.0, 1.0, 1.0};           // 三个主动臂减速比（下标 = 电机号-1）
     static inline double g_joint_dir[3] = {1.0, 1.0, 1.0};      // 每轴方向系数（+1/-1）
+    static inline double g_joint_offset[3] = {0.0, 0.0, 0.0};    // 每轴关节零位偏置（度）
     static inline double g_joint_min[3] = {-180.0, -180.0, -180.0};  // 关节角下限（度）
     static inline double g_joint_max[3] = { 180.0,  180.0,  180.0};  // 关节角上限（度）
 };
