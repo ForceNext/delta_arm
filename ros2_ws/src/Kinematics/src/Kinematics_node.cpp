@@ -49,11 +49,11 @@ public:
     jmin_ = this->declare_parameter<std::vector<double>>(
       "joint_min", std::vector<double>{-25.0, -25.0, -25.0});   // 与 hardware_config.yaml 同步
     jmax_ = this->declare_parameter<std::vector<double>>(
-      "joint_max", std::vector<double>{35.0, 35.0, 35.0});   // 最深位形 = 关节 35°
+      "joint_max", std::vector<double>{70.0, 70.0, 70.0});   // 与 hardware_config.yaml 的 max_pos 同步
     if (jmin_.size() != 3 || jmax_.size() != 3) {
-      RCLCPP_ERROR(this->get_logger(), "joint_min / joint_max 必须是 3 个数，改用默认 [-25, 35]");
+      RCLCPP_ERROR(this->get_logger(), "joint_min / joint_max 必须是 3 个数，改用默认 [-25, 70]");
       jmin_ = {-25.0, -25.0, -25.0};
-      jmax_ = {35.0, 35.0, 35.0};
+      jmax_ = {70.0, 70.0, 70.0};
     }
 
     // —— 其它参数 ——
@@ -68,6 +68,8 @@ public:
     // z 范围守卫（mm，**z 向下为正**，数值越大越深）：当前规定 z ∈ [138, 300]
     z_min_ = this->declare_parameter("z_min", 138.0);
     z_max_ = this->declare_parameter("z_max", 300.0);
+    // 末端 xy 的圆形边界（mm）：r = √(x²+y²) 不得超过它；<=0 表示不启用
+    radius_max_ = this->declare_parameter("radius_max", 150.0);
     reach_tol_ = this->declare_parameter("reach_tol_mm", 1.0);
 
     RCLCPP_INFO(
@@ -95,6 +97,13 @@ public:
     RCLCPP_INFO(
       this->get_logger(), "规定 z ∈ [%.3f, %.3f] mm（向下为正；可用 -p z_min/z_max 覆盖）", z_min_,
       z_max_);
+    if (radius_max_ > 0.0) {
+      RCLCPP_INFO(
+        this->get_logger(), "末端圆形边界: r = √(x²+y²) ≤ %.1f mm（-p radius_max 可改）",
+        radius_max_);
+    } else {
+      RCLCPP_INFO(this->get_logger(), "末端圆形边界: 未启用（radius_max<=0）");
+    }
 
     shm_ = std::make_unique<delta_arm::ShmClient>(shm_name_, sem_key_);
     if (!shm_->connect()) {
@@ -153,7 +162,19 @@ private:
       return;
     }
 
-    // ② 关节限幅
+    // ② 末端 xy 圆形边界
+    if (radius_max_ > 0.0) {
+      const double r = std::hypot(msg->x, msg->y);
+      if (r > radius_max_) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "目标半径 r=%.2f mm 超出圆形边界 %.1f mm（x=%.1f, y=%.1f），本次不下发", r, radius_max_,
+          msg->x, msg->y);
+        return;
+      }
+    }
+
+    // ③ 关节限幅
     bool clamped = false;
     for (int i = 0; i < 3; ++i) {
       if (th[i] < jmin_[i]) {
@@ -165,7 +186,7 @@ private:
       }
     }
 
-    // ③ 夹取后回代正解：若夹完已经到不了请求点，说明目标在允许工作空间之外 → 不下发
+    // ④ 夹取后回代正解：若夹完已经到不了请求点，说明目标在允许工作空间之外 → 不下发
     //    （否则底层会把"夹过的角度"当目标，实际位置和请求位置就不是同一个点了）
     double reached[3] = {0.0, 0.0, 0.0};
     if (clamped) {
@@ -280,6 +301,7 @@ private:
   double z_min_ = std::nan("");
   double z_max_ = std::nan("");
   double reach_tol_ = 1.0;
+  double radius_max_ = 150.0;
   rclcpp::Time last_msg_time_;
 };
 
