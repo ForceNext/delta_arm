@@ -130,6 +130,29 @@ ros2 topic pub -r 20 /delta_arm/target_xyz geometry_msgs/msg/Point "{x: 0.0, y: 
 ros2 run Kinematics kinematics_node --ros-args -p dry_run:=true -p L2:=290.0
 ```
 
+### 手柄遥操作（`xbox_teleop`）
+
+```bash
+ros2 run Kinematics xbox_teleop                                  # 30 Hz 发布到 /delta_arm/target_xyz
+ros2 run Kinematics xbox_teleop --ros-args -p dry_run:=true      # 只看摇杆读数，不发布
+python3 ros2_ws/src/Kinematics/scripts/xbox_teleop.py --selftest # 只验证映射方向（不需要手柄/ROS）
+```
+
+| 输入 | 作用 |
+| --- | --- |
+| 左摇杆 X（右=+1） | 末端 **x**（右推 → +x） |
+| 左摇杆 Y（上=-1） | 末端 **y**（上推 → +y） |
+| 右摇杆 Y（上=-1） | 末端 **z**（上推 → 抬升，因 z 向下为正所以取 ry 本身） |
+| 松开摇杆 | 速度为 0，目标保持不动 |
+| A | 回 `home_x/home_y/home_z`（默认 0,0,250） |
+| Y | 打印当前目标 |
+| LB / RB | 精细 ×0.25 / 加速 ×2 |
+| START | 退出节点（目标保持最后值） |
+
+参数：`max_speed_xy`(30 mm/s) `max_speed_z`(20 mm/s) `deadzone`(0.08，带平方曲线)
+`z_min/z_max`(138/300) `radius_max`(150) `home_x/home_y/home_z` `axis_lx/axis_ly/axis_ry`(默认 0/1/4)
+`rate_hz`(30) `dry_run`(false)。手柄读数可用 `python3 delta_bottom/tools/xbox_test.py --text` 核对。
+
 要点：
 - **逆解输出就是共享内存里的 `theta`（关节角，度）**，减速比/方向/零位偏置都由底层按 `hardware_config.yaml` 处理，本节点不做这些换算；
 - **坐标/角度约定**：`z` 向上为正（动平台在基座下方为负）；`θ=0` = 上臂水平朝外，`θ>0` 下压；三臂方位角 0°/120°/240°；
@@ -190,6 +213,7 @@ struct ArmStatus {           // 底层 → 上位机
 | `probe_bus.py` | 总线探测/排障：地址扫描、成功率、只听不发、`--raw` 注入任意帧（内置模式只发 `04H` 读，不会让电机动作） |
 | `read_angles.py` | **只读**打印三台角度：自动选数据源（底层在跑读共享内存，没跑则直连串口）、CRC 校验 + 重试、应用 `joint.dir`；`--capture/--ref` 显示相对角度、`--json` 纯 JSON、`--dev` 指定串口 |
 | `set_angle.py` | 向共享内存写三个关节角（`--idle` 置空闲、`--unit joint\|motor`、`--hint-jump` 只提示）；底层没在运行时拒绝写入 |
+| `xbox_test.py` | **Xbox 手柄测试**（pygame）：图形窗口显示摇杆/扳机进度条、按键方块、十字键九宫格；`--text` 无显示器模式、`--rumble` 震动、`--shot a.png` 存一帧 |
 | `calib_offset.py` | **关节零位偏置标定**：按"当前姿态 → 指定关节角"算出 `joint.offset`（`--write` 写回配置、`--counts` 可离线算） |
 | `set_zero.py` | **以当前位置为零点**（驱动器 `0xF8`）：直接运行即可；`--dry-run` 只读、`--axis` 选轴、`--ask` 才询问；底层在跑时拒绝 |
 | `testpy.py` | 串口直连调试（读版本/位置/转速/状态），参数写死，需要 `pyserial` |

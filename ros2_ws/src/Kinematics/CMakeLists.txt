@@ -43,6 +43,12 @@ target_link_libraries(ik_selftest kinematics_core)
 install(TARGETS kinematics_node ik_selftest
   DESTINATION lib/${PROJECT_NAME}
 )
+
+# 手柄遥操作（Python 节点）：ros2 run Kinematics xbox_teleop
+install(PROGRAMS scripts/xbox_teleop.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME xbox_teleop
+)
 install(DIRECTORY include/
   DESTINATION include
 )
